@@ -1,7 +1,7 @@
 """Deterministic 2D grid A* planner.
 
 Public entry point: ``plan(width, height, blocked, start, goal, costs=None,
-trace=False)``.
+trace=False, dynamic_blocked=None)``.
 
 Semantics:
 - Four-neighborhood moves, Manhattan heuristic. Without ``costs`` each step
@@ -21,6 +21,28 @@ Semantics:
   time, in expansion order (includes the start, and the goal on success);
   ``expanded == len(expanded_nodes)``. The field is omitted entirely when
   ``trace`` is false or omitted.
+
+Dynamic obstacles (``dynamic_blocked``):
+- ``dynamic_blocked`` may be omitted, ``None`` or an empty sequence, which
+  leaves the static behavior above untouched. Otherwise it must be a
+  sequence of frames; each frame is an iterable of grid coordinates that
+  are blocked at that time frame. Frame 0 constrains ``start``; the
+  coordinate at path index ``t`` must avoid both the static obstacles and
+  frame ``t``, and frames beyond the last one reuse the last frame.
+- Moves are still four-neighborhood only: no waiting in place and no
+  repeated coordinates along the path. ``cost`` is still the sum of the
+  costs of the cells entered; the start cell is never counted.
+- In dynamic mode ``expanded_nodes`` records ``(x, y, t)`` triples in
+  closing order and ``expanded`` counts closed space-time states; on
+  failure ``path``/``cost`` are ``None`` and ``expanded`` is the number of
+  space-time states actually closed. Tie-breaking compares f, then h,
+  then x, y, t, so results never depend on the iteration order of any
+  frame or coordinate set.
+- Validation: the outer value must be a sequence and every frame an
+  iterable of coordinates; strings/bytes and non-two-integer coordinates
+  raise ``TypeError``, out-of-bounds coordinates raise ``ValueError``,
+  duplicates within a frame are merged, and a ``start`` blocked at frame 0
+  raises ``ValueError``. All checks run before the search starts.
 
 Validation (all performed before the search starts):
 - ``width``/``height`` must be positive integers.
@@ -140,7 +162,120 @@ def _normalize_costs(costs, width, height):
     return tuple(rows)
 
 
-def plan(width, height, blocked, start, goal, costs=None, trace=False):
+def _normalize_dynamic_blocked(dynamic_blocked, width, height):
+    if dynamic_blocked is None:
+        return None  # dynamic mode disabled
+    if isinstance(dynamic_blocked, (str, bytes)) or not isinstance(
+        dynamic_blocked, Sequence
+    ):
+        raise TypeError(
+            f"dynamic_blocked must be a sequence of frames, "
+            f"got {type(dynamic_blocked).__name__}"
+        )
+    if len(dynamic_blocked) == 0:
+        return None  # no frames: equivalent to not provided
+    frames = []
+    for t, frame in enumerate(dynamic_blocked):
+        if isinstance(frame, (str, bytes)) or not isinstance(frame, Iterable):
+            raise TypeError(
+                f"dynamic_blocked[{t}] must be an iterable of grid "
+                f"coordinates, got {type(frame).__name__}"
+            )
+        cells = set()
+        for index, item in enumerate(frame):
+            name = f"dynamic_blocked[{t}][{index}]"
+            point = _normalize_point(item, name)
+            _check_bounds(point, width, height, name)
+            cells.add(point)  # duplicates merge into one cell
+        frames.append(frozenset(cells))
+    return frames
+
+
+def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
+                    trace):
+    """Time-expanded A* over (x, y, t) states.
+
+    Frame ``t`` constrains the cell occupied at path index ``t``; frames
+    past the last one reuse the last frame. Waiting in place and repeated
+    coordinates are forbidden, so each state's ancestor cells are tracked
+    and excluded from its successors.
+    """
+
+    def heuristic(point):
+        return abs(point[0] - goal[0]) + abs(point[1] - goal[1])
+
+    def step_cost(point):
+        # Cost of entering ``point``; the start cell is never entered.
+        if costs is None:
+            return 1
+        return costs[point[1]][point[0]]
+
+    last_frame = len(frames) - 1
+
+    def frame_cells(t):
+        return frames[t] if t <= last_frame else frames[last_frame]
+
+    # Heap entries are (f, h, x, y, t, state): the first five fields give
+    # a total, input-order-independent ordering, so the state itself is
+    # never compared.
+    start_state = (start[0], start[1], 0)
+    h0 = heuristic(start)
+    open_heap = [(h0, h0, start[0], start[1], 0, start_state)]
+    came_from = {}
+    g_score = {start_state: 0}
+    ancestors = {start_state: frozenset((start,))}
+    closed = set()
+    expanded_nodes = [] if trace else None
+
+    while open_heap:
+        _, _, _, _, _, state = heapq.heappop(open_heap)
+        if state in closed:
+            continue  # stale heap entry; already closed with its best g
+        closed.add(state)
+        if expanded_nodes is not None:
+            expanded_nodes.append(state)
+        current = (state[0], state[1])
+        if current == goal:
+            states = [state]
+            while states[-1] in came_from:
+                states.append(came_from[states[-1]])
+            states.reverse()
+            result = {
+                "path": [(s[0], s[1]) for s in states],
+                "cost": g_score[state],
+                "expanded": len(closed),
+            }
+            if trace:
+                result["expanded_nodes"] = expanded_nodes
+            return result
+        next_t = state[2] + 1
+        frame = frame_cells(next_t)
+        seen = ancestors[state]
+        for dx, dy in _NEIGHBORS:
+            nxt = (current[0] + dx, current[1] + dy)
+            if not (0 <= nxt[0] < width and 0 <= nxt[1] < height):
+                continue
+            if nxt in obstacles or nxt in frame or nxt in seen:
+                continue
+            next_state = (nxt[0], nxt[1], next_t)
+            new_g = g_score[state] + step_cost(nxt)
+            if new_g < g_score.get(next_state, float("inf")):
+                g_score[next_state] = new_g
+                came_from[next_state] = state
+                ancestors[next_state] = seen | {nxt}
+                h = heuristic(nxt)
+                heapq.heappush(
+                    open_heap,
+                    (new_g + h, h, nxt[0], nxt[1], next_t, next_state),
+                )
+    result = {"path": None, "cost": None, "expanded": len(closed)}
+    if trace:
+        result["expanded_nodes"] = expanded_nodes
+    return result
+
+
+def plan(width, height, blocked, start, goal, costs=None, trace=False,
+         dynamic_blocked=None):
     # --- Validation: everything is checked before the search begins. ---
     width = _validate_dimension(width, "width")
     height = _validate_dimension(height, "height")
@@ -157,6 +292,15 @@ def plan(width, height, blocked, start, goal, costs=None, trace=False):
     if not isinstance(trace, bool):
         raise TypeError(
             f"trace must be a bool, got {type(trace).__name__}"
+        )
+    frames = _normalize_dynamic_blocked(dynamic_blocked, width, height)
+    if frames is not None:
+        if start in frames[0]:
+            raise ValueError(
+                f"start {start} is blocked at frame 0"
+            )
+        return _search_dynamic(
+            width, height, obstacles, frames, start, goal, costs, trace
         )
 
     def heuristic(point):

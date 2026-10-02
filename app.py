@@ -1,9 +1,13 @@
 """Deterministic 2D grid A* planner.
 
-Public entry point: ``plan(width, height, blocked, start, goal)``.
+Public entry point: ``plan(width, height, blocked, start, goal, costs=None)``.
 
 Semantics:
-- Unit step cost, four-neighborhood moves, Manhattan heuristic.
+- Four-neighborhood moves, Manhattan heuristic. Step cost is the cost of
+  the cell being entered: 1 by default, or ``costs[y][x]`` when a cost
+  map is supplied. The start cell's cost is never counted.
+- ``costs`` is an optional height-by-width matrix (row-major) of positive
+  integers; ``None`` means uniform unit cost.
 - Tie-breaking is fully specified and order-independent: compare f, then h,
   then the (x, y) coordinate in lexicographic order.
 - ``expanded`` counts exactly the nodes popped from the priority queue and
@@ -17,9 +21,11 @@ Validation (all performed before the search starts):
 - ``start``, ``goal`` and every entry of ``blocked`` must be grid
   coordinates: sequences of exactly two integers (tuples, lists, etc.),
   normalized to tuples.
+- ``costs``, when given, must be a 2D sequence (not a string/bytes) of
+  ``height`` rows, each a sequence of ``width`` positive integers.
 - Type or structure violations raise ``TypeError``; non-positive
-  dimensions, out-of-bounds coordinates, or endpoints on obstacles raise
-  ``ValueError``.
+  dimensions, out-of-bounds coordinates, endpoints on obstacles, wrong
+  cost-matrix shape, or non-positive cell costs raise ``ValueError``.
 - Duplicate blocked cells are merged without changing the result.
 """
 
@@ -85,7 +91,46 @@ def _normalize_blocked(blocked, width, height):
     return cells
 
 
-def plan(width, height, blocked, start, goal):
+def _normalize_costs(costs, width, height):
+    if isinstance(costs, (str, bytes)) or not isinstance(costs, Sequence):
+        raise TypeError(
+            f"costs must be a 2D sequence of positive integers, "
+            f"got {type(costs).__name__}"
+        )
+    if len(costs) != height:
+        raise ValueError(
+            f"costs must have exactly {height} rows, got {len(costs)}"
+        )
+    grid = []
+    for y, row in enumerate(costs):
+        if isinstance(row, (str, bytes)) or not isinstance(row, Sequence):
+            raise TypeError(
+                f"costs[{y}] must be a sequence of positive integers, "
+                f"got {type(row).__name__}"
+            )
+        if len(row) != width:
+            raise ValueError(
+                f"costs[{y}] must have exactly {width} cells, "
+                f"got {len(row)}"
+            )
+        normalized_row = []
+        for x, cell in enumerate(row):
+            if not _is_int(cell):
+                raise TypeError(
+                    f"costs[{y}][{x}] must be an int, "
+                    f"got {type(cell).__name__}"
+                )
+            if cell <= 0:
+                raise ValueError(
+                    f"costs[{y}][{x}] must be a positive integer, "
+                    f"got {cell}"
+                )
+            normalized_row.append(cell)
+        grid.append(tuple(normalized_row))
+    return tuple(grid)
+
+
+def plan(width, height, blocked, start, goal, costs=None):
     # --- Validation: everything is checked before the search begins. ---
     width = _validate_dimension(width, "width")
     height = _validate_dimension(height, "height")
@@ -98,6 +143,13 @@ def plan(width, height, blocked, start, goal):
         raise ValueError(f"start {start} lies on a blocked cell")
     if goal in obstacles:
         raise ValueError(f"goal {goal} lies on a blocked cell")
+    cost_grid = None if costs is None else _normalize_costs(costs, width, height)
+
+    def step_cost(point):
+        # Cost of entering ``point``; the start cell is never entered.
+        if cost_grid is None:
+            return 1
+        return cost_grid[point[1]][point[0]]
 
     def heuristic(point):
         return abs(point[0] - goal[0]) + abs(point[1] - goal[1])
@@ -132,7 +184,7 @@ def plan(width, height, blocked, start, goal):
                 continue
             if nxt in obstacles:
                 continue
-            new_g = g_score[current] + 1
+            new_g = g_score[current] + step_cost(nxt)
             if new_g < g_score.get(nxt, float("inf")):
                 g_score[nxt] = new_g
                 came_from[nxt] = current

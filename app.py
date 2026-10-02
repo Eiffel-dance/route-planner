@@ -1,6 +1,7 @@
 """Deterministic 2D grid A* planner.
 
-Public entry point: ``plan(width, height, blocked, start, goal, costs=None)``.
+Public entry point: ``plan(width, height, blocked, start, goal, costs=None,
+trace=False)``.
 
 Semantics:
 - Four-neighborhood moves, Manhattan heuristic. Without ``costs`` each step
@@ -15,6 +16,11 @@ Semantics:
   entries and duplicate closings do not).
 - Returns ``{"path": [...], "cost": int, "expanded": int}`` on success and
   ``{"path": None, "cost": None, "expanded": int}`` when unreachable.
+- When ``trace`` is true, both kinds of results additionally include
+  ``expanded_nodes``: the list of coordinate tuples closed for the first
+  time, in expansion order (includes the start, and the goal on success);
+  ``expanded == len(expanded_nodes)``. The field is omitted entirely when
+  ``trace`` is false or omitted.
 
 Validation (all performed before the search starts):
 - ``width``/``height`` must be positive integers.
@@ -24,6 +30,7 @@ Validation (all performed before the search starts):
 - ``costs`` may be omitted or ``None`` (unit costs). Otherwise it must be a
   sequence of ``height`` rows, each a sequence of ``width`` positive
   integers; strings/bytes, non-integer cells and booleans are rejected.
+- ``trace`` must be a bool; non-bool values raise ``TypeError``.
 - Type or structure violations raise ``TypeError``; non-positive
   dimensions, out-of-bounds coordinates, endpoints on obstacles, wrong
   matrix shape, or non-positive cell costs raise ``ValueError``.
@@ -133,7 +140,7 @@ def _normalize_costs(costs, width, height):
     return tuple(rows)
 
 
-def plan(width, height, blocked, start, goal, costs=None):
+def plan(width, height, blocked, start, goal, costs=None, trace=False):
     # --- Validation: everything is checked before the search begins. ---
     width = _validate_dimension(width, "width")
     height = _validate_dimension(height, "height")
@@ -147,6 +154,10 @@ def plan(width, height, blocked, start, goal, costs=None):
     if goal in obstacles:
         raise ValueError(f"goal {goal} lies on a blocked cell")
     costs = _normalize_costs(costs, width, height)
+    if not isinstance(trace, bool):
+        raise TypeError(
+            f"trace must be a bool, got {type(trace).__name__}"
+        )
 
     def heuristic(point):
         return abs(point[0] - goal[0]) + abs(point[1] - goal[1])
@@ -165,22 +176,28 @@ def plan(width, height, blocked, start, goal, costs=None):
     came_from = {}
     g_score = {start: 0}
     closed = set()
+    expanded_nodes = [] if trace else None
 
     while open_heap:
         _, _, _, _, current = heapq.heappop(open_heap)
         if current in closed:
             continue  # stale heap entry; already closed with its best g
         closed.add(current)
+        if expanded_nodes is not None:
+            expanded_nodes.append(current)
         if current == goal:
             path = [current]
             while path[-1] in came_from:
                 path.append(came_from[path[-1]])
             path.reverse()
-            return {
+            result = {
                 "path": path,
                 "cost": g_score[current],
                 "expanded": len(closed),
             }
+            if trace:
+                result["expanded_nodes"] = expanded_nodes
+            return result
         for dx, dy in _NEIGHBORS:
             nxt = (current[0] + dx, current[1] + dy)
             if not (0 <= nxt[0] < width and 0 <= nxt[1] < height):
@@ -195,4 +212,7 @@ def plan(width, height, blocked, start, goal, costs=None):
                 heapq.heappush(
                     open_heap, (new_g + h, h, nxt[0], nxt[1], nxt)
                 )
-    return {"path": None, "cost": None, "expanded": len(closed)}
+    result = {"path": None, "cost": None, "expanded": len(closed)}
+    if trace:
+        result["expanded_nodes"] = expanded_nodes
+    return result

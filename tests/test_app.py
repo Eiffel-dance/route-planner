@@ -123,5 +123,90 @@ class ValidationTest(unittest.TestCase):
             plan(1, 1, set(), (0, 0), "nope")
 
 
+class TraceTest(unittest.TestCase):
+    def test_trace_disabled_matches_default(self):
+        kwargs = dict(width=6, height=4,
+                      blocked={(2, 0), (2, 1), (2, 2), (0, 2), (4, 1)},
+                      start=(0, 0), goal=(5, 3))
+        default = plan(**kwargs)
+        explicit = plan(trace=False, **kwargs)
+        self.assertEqual(default, explicit)
+        self.assertEqual(set(default), {"path", "cost", "expanded"})
+
+    def test_trace_success(self):
+        blocked = {(2, 0), (2, 1), (2, 2), (0, 2), (4, 1)}
+        result = plan(6, 4, blocked, (0, 0), (5, 3), trace=True)
+        self.assertEqual(set(result),
+                         {"path", "cost", "expanded", "expanded_nodes"})
+        nodes = result["expanded_nodes"]
+        self.assertEqual(result["expanded"], len(nodes))
+        self.assertEqual(nodes[0], (0, 0))
+        self.assertEqual(nodes[-1], (5, 3))
+        self.assertEqual(len(set(nodes)), len(nodes))  # no duplicates
+        self.assertTrue(set(nodes).isdisjoint(blocked))
+        self.assertTrue(all(isinstance(p, tuple) for p in nodes))
+
+    def test_trace_unreachable(self):
+        blocked = {(1, y) for y in range(3)}
+        result = plan(3, 3, blocked, (0, 0), (2, 2), trace=True)
+        self.assertIsNone(result["path"])
+        self.assertIsNone(result["cost"])
+        self.assertEqual(result["expanded"], len(result["expanded_nodes"]))
+        self.assertEqual(result["expanded_nodes"],
+                         [(0, 0), (0, 1), (0, 2)])
+
+    def test_trace_start_equals_goal(self):
+        result = plan(3, 3, set(), (1, 1), (1, 1), trace=True)
+        self.assertEqual(result, {
+            "path": [(1, 1)],
+            "cost": 0,
+            "expanded": 1,
+            "expanded_nodes": [(1, 1)],
+        })
+
+    def test_trace_expansion_order(self):
+        # Straight 4x1 corridor: every node closes in coordinate order.
+        result = plan(4, 1, set(), (0, 0), (3, 0), trace=True)
+        self.assertEqual(result["expanded_nodes"],
+                         [(0, 0), (1, 0), (2, 0), (3, 0)])
+        # 2x3 open grid: A* runs down the left column, then the goal closes
+        # with h=0 before the remaining stale-priority nodes.
+        result = plan(2, 3, set(), (0, 0), (1, 2), trace=True)
+        self.assertEqual(result["expanded_nodes"],
+                         [(0, 0), (0, 1), (0, 2), (1, 2)])
+
+    def test_trace_independent_of_blocked_order(self):
+        cells = [(x, 1) for x in range(5) if x != 2]
+        forward = plan(5, 3, cells, (0, 0), (4, 2), trace=True)
+        reverse = plan(5, 3, list(reversed(cells)), (0, 0), (4, 2),
+                       trace=True)
+        repeated = plan(5, 3, cells + [cells[0]] * 3, (0, 0), (4, 2),
+                        trace=True)
+        self.assertEqual(forward, reverse)
+        self.assertEqual(forward, repeated)
+
+    def test_trace_with_costs(self):
+        costs = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+        result = plan(3, 3, set(), (0, 0), (2, 2), costs=costs, trace=True)
+        nodes = result["expanded_nodes"]
+        self.assertEqual(nodes[0], (0, 0))
+        self.assertEqual(nodes[-1], (2, 2))
+        self.assertEqual(result["cost"],
+                         sum(costs[y][x] for x, y in result["path"][1:]))
+
+    def test_trace_must_be_bool(self):
+        for bad in (1, 0, "true", None, [], 1.0):
+            with self.assertRaises(TypeError, msg=f"trace={bad!r}"):
+                plan(3, 3, set(), (0, 0), (2, 2), trace=bad)
+
+    def test_existing_errors_take_precedence_over_trace(self):
+        with self.assertRaises(TypeError):  # bad width, not bad trace
+            plan("3", 3, set(), (0, 0), (1, 1), trace="x")
+        with self.assertRaises(ValueError):  # zero height, not bad trace
+            plan(3, 0, set(), (0, 0), (1, 1), trace="x")
+        with self.assertRaises(ValueError):  # endpoint on blocked cell
+            plan(3, 3, {(2, 2)}, (0, 0), (2, 2), trace=1)
+
+
 if __name__ == '__main__':
     unittest.main()

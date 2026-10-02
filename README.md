@@ -11,7 +11,7 @@ Tests: python3 -m unittest discover -s tests -v
 
 ## API 约定
 
-`plan(width, height, blocked, start, goal, costs=None)` 返回 `{"path", "cost", "expanded"}`。
+`plan(width, height, blocked, start, goal, costs=None, trace=False)` 默认返回 `{"path", "cost", "expanded"}`。
 
 **输入校验（搜索开始前完成）**
 - `width`、`height` 必须为正整数。
@@ -24,3 +24,9 @@ Tests: python3 -m unittest discover -s tests -v
 - 四邻域移动，曼哈顿启发式。未提供 `costs` 时为单位步长代价；提供时进入格子的代价为该格的值，起点代价不计入，`cost` 等于路径所进入格子的代价之和。
 - 平局次序固定且公开：先比较 f，再比较 h，再按 (x, y) 字典序；结果不依赖 `blocked` 的迭代顺序。
 - `expanded` 只统计从优先队列取出并首次关闭的节点；成功时计入 goal，`start == goal` 时返回单节点路径、代价 0、`expanded` 为 1；不可达时 `path`/`cost` 为 `None`，`expanded` 等于实际关闭的可通行节点数。
+
+**轨迹输出（`trace=True`）**
+- `trace` 只能是布尔值，其他类型在搜索开始前抛出 `TypeError`；该校验在既有 width/height/端点/blocked/costs 校验之后执行，不改变既有错误优先级。
+- 成功与不可达结果都额外返回 `expanded_nodes`：节点首次关闭时按顺序记录的坐标元组列表，含 `start`；成功时以 `goal` 结尾，不可达时记录搜索结束前关闭的全部可通行节点。
+- `expanded_nodes` 不含未计入 `expanded` 的项、重复坐标或障碍物，且 `expanded == len(expanded_nodes)`；`start == goal` 时序列只含一个坐标。
+- `trace` 省略或为 `False` 时结果中不出现该字段，键、值、校验顺序与路径选择与默认调用完全一致；坐标为公开元组，可直接 JSON 序列化用于离线回放。

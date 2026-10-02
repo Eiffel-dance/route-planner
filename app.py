@@ -1,15 +1,143 @@
+"""Deterministic 2D grid A* planner.
+
+Public entry point: ``plan(width, height, blocked, start, goal)``.
+
+Semantics:
+- Unit step cost, four-neighborhood moves, Manhattan heuristic.
+- Tie-breaking is fully specified and order-independent: compare f, then h,
+  then the (x, y) coordinate in lexicographic order.
+- ``expanded`` counts exactly the nodes popped from the priority queue and
+  closed for the first time (the goal counts when reached; stale heap
+  entries and duplicate closings do not).
+- Returns ``{"path": [...], "cost": int, "expanded": int}`` on success and
+  ``{"path": None, "cost": None, "expanded": int}`` when unreachable.
+
+Validation (all performed before the search starts):
+- ``width``/``height`` must be positive integers.
+- ``start``, ``goal`` and every entry of ``blocked`` must be grid
+  coordinates: sequences of exactly two integers (tuples, lists, etc.),
+  normalized to tuples.
+- Type or structure violations raise ``TypeError``; non-positive
+  dimensions, out-of-bounds coordinates, or endpoints on obstacles raise
+  ``ValueError``.
+- Duplicate blocked cells are merged without changing the result.
+"""
+
 import heapq
-def plan(width,height,blocked,start,goal):
-    blocked=set(blocked); q=[(0,0,start)]; came={}; cost={start:0}; serial=0
-    def h(p): return abs(p[0]-goal[0])+abs(p[1]-goal[1])
-    while q:
-        _,_,cur=heapq.heappop(q)
-        if cur==goal:
-            path=[cur]
-            while path[-1] in came: path.append(came[path[-1]])
-            path.reverse(); return {"path":path,"cost":cost[cur],"expanded":len(cost)}
-        for nxt in ((cur[0]+1,cur[1]),(cur[0]-1,cur[1]),(cur[0],cur[1]+1),(cur[0],cur[1]-1)):
-            if not(0<=nxt[0]<width and 0<=nxt[1]<height) or nxt in blocked: continue
-            new=cost[cur]+1
-            if new<cost.get(nxt,10**9): cost[nxt]=new; came[nxt]=cur; serial+=1; heapq.heappush(q,(new+h(nxt),serial,nxt))
-    return {"path":None,"cost":None,"expanded":len(cost)}
+from collections.abc import Iterable, Sequence
+
+__all__ = ["plan"]
+
+# Fixed neighbor generation order: +x, -x, +y, -y.
+_NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1))
+
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _validate_dimension(value, name):
+    if not _is_int(value):
+        raise TypeError(
+            f"{name} must be an int, got {type(value).__name__}"
+        )
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value}")
+    return value
+
+
+def _normalize_point(value, name):
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise TypeError(
+            f"{name} must be a sequence of two integers, "
+            f"got {type(value).__name__}"
+        )
+    if len(value) != 2:
+        raise TypeError(
+            f"{name} must contain exactly two coordinates, got {len(value)}"
+        )
+    x, y = value[0], value[1]
+    if not _is_int(x) or not _is_int(y):
+        raise TypeError(f"{name} coordinates must be integers, got {value!r}")
+    return (x, y)
+
+
+def _check_bounds(point, width, height, name):
+    x, y = point
+    if not (0 <= x < width and 0 <= y < height):
+        raise ValueError(
+            f"{name} {point} is outside the {width}x{height} grid"
+        )
+
+
+def _normalize_blocked(blocked, width, height):
+    if isinstance(blocked, (str, bytes)) or not isinstance(blocked, Iterable):
+        raise TypeError(
+            f"blocked must be an iterable of grid coordinates, "
+            f"got {type(blocked).__name__}"
+        )
+    cells = set()
+    for index, item in enumerate(blocked):
+        name = f"blocked[{index}]"
+        point = _normalize_point(item, name)
+        _check_bounds(point, width, height, name)
+        cells.add(point)  # duplicates merge into one cell
+    return cells
+
+
+def plan(width, height, blocked, start, goal):
+    # --- Validation: everything is checked before the search begins. ---
+    width = _validate_dimension(width, "width")
+    height = _validate_dimension(height, "height")
+    start = _normalize_point(start, "start")
+    goal = _normalize_point(goal, "goal")
+    _check_bounds(start, width, height, "start")
+    _check_bounds(goal, width, height, "goal")
+    obstacles = _normalize_blocked(blocked, width, height)
+    if start in obstacles:
+        raise ValueError(f"start {start} lies on a blocked cell")
+    if goal in obstacles:
+        raise ValueError(f"goal {goal} lies on a blocked cell")
+
+    def heuristic(point):
+        return abs(point[0] - goal[0]) + abs(point[1] - goal[1])
+
+    # Heap entries are (f, h, x, y, point): the first four fields give a
+    # total, input-order-independent ordering, so the point itself is never
+    # compared.
+    h0 = heuristic(start)
+    open_heap = [(h0, h0, start[0], start[1], start)]
+    came_from = {}
+    g_score = {start: 0}
+    closed = set()
+
+    while open_heap:
+        _, _, _, _, current = heapq.heappop(open_heap)
+        if current in closed:
+            continue  # stale heap entry; already closed with its best g
+        closed.add(current)
+        if current == goal:
+            path = [current]
+            while path[-1] in came_from:
+                path.append(came_from[path[-1]])
+            path.reverse()
+            return {
+                "path": path,
+                "cost": g_score[current],
+                "expanded": len(closed),
+            }
+        for dx, dy in _NEIGHBORS:
+            nxt = (current[0] + dx, current[1] + dy)
+            if not (0 <= nxt[0] < width and 0 <= nxt[1] < height):
+                continue
+            if nxt in obstacles:
+                continue
+            new_g = g_score[current] + 1
+            if new_g < g_score.get(nxt, float("inf")):
+                g_score[nxt] = new_g
+                came_from[nxt] = current
+                h = heuristic(nxt)
+                heapq.heappush(
+                    open_heap, (new_g + h, h, nxt[0], nxt[1], nxt)
+                )
+    return {"path": None, "cost": None, "expanded": len(closed)}

@@ -1,9 +1,13 @@
 """Deterministic 2D grid A* planner.
 
-Public entry point: ``plan(width, height, blocked, start, goal)``.
+Public entry point: ``plan(width, height, blocked, start, goal, costs=None)``.
 
 Semantics:
-- Unit step cost, four-neighborhood moves, Manhattan heuristic.
+- Four-neighborhood moves, Manhattan heuristic. Without ``costs`` each step
+  has unit cost. With ``costs`` (a height-by-width matrix of positive
+  integers, row-major: ``costs[y][x]``) entering a cell costs that cell's
+  value; the start cell's cost is never counted, so ``cost`` is the sum of
+  the costs of the cells entered along the path.
 - Tie-breaking is fully specified and order-independent: compare f, then h,
   then the (x, y) coordinate in lexicographic order.
 - ``expanded`` counts exactly the nodes popped from the priority queue and
@@ -17,9 +21,12 @@ Validation (all performed before the search starts):
 - ``start``, ``goal`` and every entry of ``blocked`` must be grid
   coordinates: sequences of exactly two integers (tuples, lists, etc.),
   normalized to tuples.
+- ``costs`` may be omitted or ``None`` (unit costs). Otherwise it must be a
+  sequence of ``height`` rows, each a sequence of ``width`` positive
+  integers; strings/bytes, non-integer cells and booleans are rejected.
 - Type or structure violations raise ``TypeError``; non-positive
-  dimensions, out-of-bounds coordinates, or endpoints on obstacles raise
-  ``ValueError``.
+  dimensions, out-of-bounds coordinates, endpoints on obstacles, wrong
+  matrix shape, or non-positive cell costs raise ``ValueError``.
 - Duplicate blocked cells are merged without changing the result.
 """
 
@@ -85,7 +92,48 @@ def _normalize_blocked(blocked, width, height):
     return cells
 
 
-def plan(width, height, blocked, start, goal):
+def _normalize_costs(costs, width, height):
+    if costs is None:
+        return None  # unit step cost
+    if isinstance(costs, (str, bytes)) or not isinstance(costs, Sequence):
+        raise TypeError(
+            f"costs must be a height-by-width matrix of positive integers, "
+            f"got {type(costs).__name__}"
+        )
+    if len(costs) != height:
+        raise ValueError(
+            f"costs must have exactly {height} rows, got {len(costs)}"
+        )
+    rows = []
+    for y, row in enumerate(costs):
+        if isinstance(row, (str, bytes)) or not isinstance(row, Sequence):
+            raise TypeError(
+                f"costs[{y}] must be a sequence of {width} positive "
+                f"integers, got {type(row).__name__}"
+            )
+        if len(row) != width:
+            raise ValueError(
+                f"costs[{y}] must have exactly {width} cells, "
+                f"got {len(row)}"
+            )
+        parsed = []
+        for x, cell in enumerate(row):
+            if not _is_int(cell):
+                raise TypeError(
+                    f"costs[{y}][{x}] must be an int, "
+                    f"got {type(cell).__name__}"
+                )
+            if cell <= 0:
+                raise ValueError(
+                    f"costs[{y}][{x}] must be a positive integer, "
+                    f"got {cell}"
+                )
+            parsed.append(cell)
+        rows.append(tuple(parsed))
+    return tuple(rows)
+
+
+def plan(width, height, blocked, start, goal, costs=None):
     # --- Validation: everything is checked before the search begins. ---
     width = _validate_dimension(width, "width")
     height = _validate_dimension(height, "height")
@@ -98,9 +146,16 @@ def plan(width, height, blocked, start, goal):
         raise ValueError(f"start {start} lies on a blocked cell")
     if goal in obstacles:
         raise ValueError(f"goal {goal} lies on a blocked cell")
+    costs = _normalize_costs(costs, width, height)
 
     def heuristic(point):
         return abs(point[0] - goal[0]) + abs(point[1] - goal[1])
+
+    def step_cost(point):
+        # Cost of entering ``point``; the start cell is never entered.
+        if costs is None:
+            return 1
+        return costs[point[1]][point[0]]
 
     # Heap entries are (f, h, x, y, point): the first four fields give a
     # total, input-order-independent ordering, so the point itself is never
@@ -132,7 +187,7 @@ def plan(width, height, blocked, start, goal):
                 continue
             if nxt in obstacles:
                 continue
-            new_g = g_score[current] + 1
+            new_g = g_score[current] + step_cost(nxt)
             if new_g < g_score.get(nxt, float("inf")):
                 g_score[nxt] = new_g
                 came_from[nxt] = current

@@ -255,5 +255,153 @@ class TraceTest(unittest.TestCase):
             plan(0, 3, set(), (0, 0), (1, 1), trace=1)
 
 
+class DynamicPlannerTest(unittest.TestCase):
+    # A case where two (here three) different histories reach the same
+    # (x, y, t). The history closed first cannot be extended (its only
+    # continuation revisits a cell); a later history reaches the goal.
+    # Collapsing equal (x, y, t) states used to report no route here.
+    HISTORY_FRAMES = [
+        [(0, 1), (0, 2)],
+        [(0, 1), (1, 2), (2, 0), (2, 2)],
+        [(2, 1), (2, 2)],
+        [(0, 0), (1, 2), (2, 1), (2, 2)],
+        [],
+        [(0, 1)],
+    ]
+    HISTORY_PATH = [(1, 0), (0, 0), (0, 1), (0, 2), (1, 2), (2, 2)]
+
+    def _assert_route_valid(self, result, frames, obstacles=frozenset()):
+        path = result["path"]
+        self.assertIsNotNone(path)
+        self.assertEqual(len(path), len(set(path)))  # no repeated cells
+        last = len(frames) - 1
+        for t, cell in enumerate(path):
+            self.assertNotIn(cell, obstacles)
+            self.assertNotIn(cell, frames[t] if t <= last else frames[last])
+        for a, b in zip(path, path[1:]):
+            self.assertEqual(abs(a[0] - b[0]) + abs(a[1] - b[1]), 1)
+
+    def test_basic_dynamic_route_avoids_frames(self):
+        # Only one frame is given, so it persists: (1, 0) is blocked at
+        # every t >= 1 and the direct row is unusable.
+        frames = [[], [(1, 0)]]
+        result = plan(3, 3, set(), (0, 0), (2, 0), dynamic_blocked=frames)
+        self.assertEqual(result["path"],
+                         [(0, 0), (0, 1), (1, 1), (2, 1), (2, 0)])
+        self.assertEqual(result["cost"], 4)
+        self._assert_route_valid(result, frames)
+        self.assertNotIn("expanded_nodes", result)
+
+    def test_history_dependent_completeness(self):
+        result = plan(3, 3, set(), (1, 0), (2, 2), trace=True,
+                      dynamic_blocked=self.HISTORY_FRAMES)
+        self.assertEqual(result["path"], self.HISTORY_PATH)
+        self.assertEqual(result["cost"], 5)
+        self._assert_route_valid(result, self.HISTORY_FRAMES)
+
+    def test_equal_cost_tie_uses_path_lexicographic_order(self):
+        # Empty 3x3: all shortest routes cost 4; the lexicographically
+        # smallest coordinate sequence must win regardless of traversal.
+        frames = [[] for _ in range(5)]
+        result = plan(3, 3, set(), (0, 0), (2, 2), dynamic_blocked=frames)
+        self.assertEqual(result["path"],
+                         [(0, 0), (0, 1), (0, 2), (1, 2), (2, 2)])
+
+    def test_no_route_returns_none(self):
+        # Frame 1 blocks every neighbor of the start.
+        frames = [[], [(1, 0), (0, 1)]]
+        result = plan(2, 2, set(), (0, 0), (1, 1), trace=True,
+                      dynamic_blocked=frames)
+        self.assertIsNone(result["path"])
+        self.assertIsNone(result["cost"])
+        self.assertGreaterEqual(result["expanded"], 1)
+        self.assertEqual(result["expanded"], len(result["expanded_nodes"]))
+
+    def test_start_equals_goal_dynamic(self):
+        result = plan(3, 3, set(), (1, 1), (1, 1), trace=True,
+                      dynamic_blocked=[[], [(0, 0)]])
+        self.assertEqual(result["path"], [(1, 1)])
+        self.assertEqual(result["cost"], 0)
+        self.assertEqual(result["expanded"], 1)
+        self.assertEqual(result["expanded_nodes"], [(1, 1, 0)])
+
+    def test_trace_records_histories_separately_in_closing_order(self):
+        result = plan(3, 3, set(), (1, 0), (2, 2), trace=True,
+                      dynamic_blocked=self.HISTORY_FRAMES)
+        nodes = result["expanded_nodes"]
+        self.assertEqual(result["expanded"], len(nodes))
+        self.assertTrue(all(isinstance(s, tuple) and len(s) == 3
+                            for s in nodes))
+        self.assertEqual(nodes[0], (1, 0, 0))
+        # Three distinct histories close (0, 2) at t=3: the triple appears
+        # once per closing, in the actual closing order -- never deduplicated.
+        self.assertEqual(nodes.count((0, 2, 3)), 3)
+        # Every complete feasible route closes the goal once; the last
+        # closing is a goal closing.
+        self.assertEqual(nodes.count((2, 2, 5)), 4)
+        self.assertEqual(nodes[-1], (2, 2, 5))
+
+    def test_result_independent_of_input_ordering(self):
+        orders = [
+            self.HISTORY_FRAMES,
+            [list(reversed(f)) for f in self.HISTORY_FRAMES],
+            [set(f) for f in self.HISTORY_FRAMES],
+            [tuple(f) + (f[0],) if f else () for f in self.HISTORY_FRAMES],
+        ]
+        first = plan(3, 3, set(), (1, 0), (2, 2), trace=True,
+                     dynamic_blocked=orders[0])
+        for frames in orders[1:]:
+            self.assertEqual(
+                plan(3, 3, set(), (1, 0), (2, 2), trace=True,
+                     dynamic_blocked=frames),
+                first,
+            )
+        # Repeated static obstacles are merged without changing the result.
+        with_dupes = plan(3, 3, [(2, 0), (2, 0)], (1, 0), (2, 2), trace=True,
+                          dynamic_blocked=orders[0])
+        self.assertEqual(with_dupes["path"], first["path"])
+        self.assertEqual(with_dupes["cost"], first["cost"])
+
+    def test_empty_dynamic_blocked_matches_static(self):
+        blocked = [(2, 0), (2, 1), (2, 2)]
+        static = plan(6, 4, blocked, (0, 0), (5, 3), trace=True)
+        for kwargs in ({"dynamic_blocked": None},
+                       {"dynamic_blocked": []},
+                       {"dynamic_blocked": ()}):
+            self.assertEqual(
+                plan(6, 4, blocked, (0, 0), (5, 3), trace=True, **kwargs),
+                static,
+            )
+
+    def test_costs_accounting_preserved(self):
+        costs = [[1, 1, 1], [1, 1, 100], [1, 1, 1]]
+        result = plan(3, 3, set(), (1, 0), (2, 2), costs=costs,
+                      dynamic_blocked=self.HISTORY_FRAMES)
+        self.assertEqual(result["path"], self.HISTORY_PATH)
+        self.assertEqual(result["cost"],
+                         sum(costs[y][x] for x, y in result["path"][1:]))
+
+    def test_validation_preserved_in_dynamic_mode(self):
+        with self.assertRaises(TypeError):
+            plan(3, 3, set(), (0, 0), (1, 1), dynamic_blocked=42)
+        with self.assertRaises(TypeError):
+            plan(3, 3, set(), (0, 0), (1, 1), dynamic_blocked="ab")
+        with self.assertRaises(TypeError):
+            plan(3, 3, set(), (0, 0), (1, 1), dynamic_blocked=[42])
+        with self.assertRaises(TypeError):
+            plan(3, 3, set(), (0, 0), (1, 1),
+                 dynamic_blocked=[[(1, 1.0)]])
+        with self.assertRaises(ValueError):
+            plan(3, 3, set(), (0, 0), (1, 1),
+                 dynamic_blocked=[[(3, 3)]])
+        with self.assertRaises(ValueError):
+            plan(3, 3, set(), (0, 0), (1, 1),
+                 dynamic_blocked=[[(0, 0)]])  # start blocked at frame 0
+        # Validation order: width ValueError precedes the trace TypeError.
+        with self.assertRaises(ValueError):
+            plan(0, 3, set(), (0, 0), (1, 1), trace=1,
+                 dynamic_blocked=[[]])
+
+
 if __name__ == '__main__':
     unittest.main()

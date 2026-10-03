@@ -30,14 +30,23 @@ Dynamic obstacles (``dynamic_blocked``):
   coordinate at path index ``t`` must avoid both the static obstacles and
   frame ``t``, and frames beyond the last one reuse the last frame.
 - Moves are still four-neighborhood only: no waiting in place and no
-  repeated coordinates along the path. ``cost`` is still the sum of the
-  costs of the cells entered; the start cell is never counted.
+  repeated coordinates along the path. Because feasibility of a route
+  depends on the coordinates it already visited, candidates that reach the
+  same ``(x, y, t)`` through different coordinate histories are distinct
+  states and are never merged: every route that satisfies the constraints
+  can be explored. ``cost`` is still the sum of the costs of the cells
+  entered; the start cell is never counted.
+- The minimum-cost feasible route is returned. When total costs tie, the
+  fixed priority is f, then h, then x, y, t, and candidates still tied are
+  ordered lexicographically by their complete coordinate sequence, so the
+  result never depends on the iteration order of the obstacle sets, the
+  coordinates inside a frame, or the traversal order.
 - In dynamic mode ``expanded_nodes`` records ``(x, y, t)`` triples in
-  closing order and ``expanded`` counts closed space-time states; on
-  failure ``path``/``cost`` are ``None`` and ``expanded`` is the number of
-  space-time states actually closed. Tie-breaking compares f, then h,
-  then x, y, t, so results never depend on the iteration order of any
-  frame or coordinate set.
+  actual closing order and ``expanded`` counts closed space-time route
+  states one per entry; a discarded candidate is never recorded. When the
+  same ``(x, y, t)`` is closed through different histories, its triple
+  appears once per closing in closing order, and ``expanded`` counts each
+  such entry. On failure ``path``/``cost`` are ``None``.
 - Validation: the outer value must be a sequence and every frame an
   iterable of coordinates; strings/bytes and non-two-integer coordinates
   raise ``TypeError``, out-of-bounds coordinates raise ``ValueError``,
@@ -193,12 +202,21 @@ def _normalize_dynamic_blocked(dynamic_blocked, width, height):
 
 def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
                     trace):
-    """Time-expanded A* over (x, y, t) states.
+    """History-sensitive time-expanded A*.
 
     Frame ``t`` constrains the cell occupied at path index ``t``; frames
     past the last one reuse the last frame. Waiting in place and repeated
-    coordinates are forbidden, so each state's ancestor cells are tracked
-    and excluded from its successors.
+    coordinates are forbidden, so whether a candidate route can be
+    extended depends on the exact sequence of cells it already visited:
+    two routes reaching the same ``(x, y, t)`` with different histories
+    are distinct states and neither may prune the other (the route with
+    the larger accumulated cost can be the only one that remains
+    extendable). Each heap node therefore carries its complete path; the
+    search is a best-first traversal of the feasible route tree. Goal
+    closings are collected until the heap's smallest f exceeds the best
+    goal cost, after which the minimum-cost goal tie-break is settled by
+    the fixed f, h, x, y, t priority and then the complete path's
+    lexicographic order.
     """
 
     def heuristic(point):
@@ -215,60 +233,76 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
     def frame_cells(t):
         return frames[t] if t <= last_frame else frames[last_frame]
 
-    # Heap entries are (f, h, x, y, t, state): the first five fields give
-    # a total, input-order-independent ordering, so the state itself is
-    # never compared.
-    start_state = (start[0], start[1], 0)
     h0 = heuristic(start)
-    open_heap = [(h0, h0, start[0], start[1], 0, start_state)]
-    came_from = {}
-    g_score = {start_state: 0}
-    ancestors = {start_state: frozenset((start,))}
-    closed = set()
+    if start == goal:
+        # Single-point, zero-cost result; frame 0 was checked upstream.
+        result = {"path": [start], "cost": 0, "expanded": 1}
+        if trace:
+            result["expanded_nodes"] = [(start[0], start[1], 0)]
+        return result
+
+    # Heap entries are (f, h, x, y, t, g, path, seen): f/h/x/y/t give the
+    # fixed numeric priority and candidates still tied are ordered by the
+    # complete coordinate path lexicographically, so ordering never depends
+    # on obstacle sets, in-frame coordinate order, or traversal order. The
+    # frozenset ``seen`` mirrors ``path`` for an O(1) repeat check and is
+    # never compared (distinct histories always differ in ``path``).
+    start_path = (start,)
+    open_heap = [(h0, h0, start[0], start[1], 0, 0, start_path,
+                  frozenset(start_path))]
+    closed_count = 0
     expanded_nodes = [] if trace else None
+    # Best goal closing seen so far, keyed exactly as the tie-break
+    # specializes at the goal: (g, t, path) (there f == g, h == 0 and
+    # (x, y) is fixed). Closing a goal does not stop the search
+    # immediately: an equally cheap route whose chain runs through
+    # higher-h nodes might still be undeveloped. Since each move costs at
+    # least 1 and the Manhattan h changes by at most 1 per move, f = g + h
+    # never decreases along a route; once the smallest f on the heap
+    # exceeds the best goal cost, no route of that cost (or less) can
+    # remain undiscovered.
+    best_key = None
 
     while open_heap:
-        _, _, _, _, _, state = heapq.heappop(open_heap)
-        if state in closed:
-            continue  # stale heap entry; already closed with its best g
-        closed.add(state)
+        if best_key is not None and open_heap[0][0] > best_key[0]:
+            break
+        _, _, x, y, t, g, path, seen = heapq.heappop(open_heap)
+        closed_count += 1  # every popped route node closes exactly once
         if expanded_nodes is not None:
-            expanded_nodes.append(state)
-        current = (state[0], state[1])
-        if current == goal:
-            states = [state]
-            while states[-1] in came_from:
-                states.append(came_from[states[-1]])
-            states.reverse()
-            result = {
-                "path": [(s[0], s[1]) for s in states],
-                "cost": g_score[state],
-                "expanded": len(closed),
-            }
-            if trace:
-                result["expanded_nodes"] = expanded_nodes
-            return result
-        next_t = state[2] + 1
+            # Histories reaching the same (x, y, t) each record a triple,
+            # in the order their route nodes are actually closed.
+            expanded_nodes.append((x, y, t))
+        if (x, y) == goal:
+            goal_key = (g, t, path)
+            if best_key is None or goal_key < best_key:
+                best_key = goal_key
+            continue  # routes end at the goal; never expanded past it
+        next_t = t + 1
         frame = frame_cells(next_t)
-        seen = ancestors[state]
         for dx, dy in _NEIGHBORS:
-            nxt = (current[0] + dx, current[1] + dy)
-            if not (0 <= nxt[0] < width and 0 <= nxt[1] < height):
+            nx, ny = x + dx, y + dy
+            if not (0 <= nx < width and 0 <= ny < height):
                 continue
+            nxt = (nx, ny)
             if nxt in obstacles or nxt in frame or nxt in seen:
-                continue
-            next_state = (nxt[0], nxt[1], next_t)
-            new_g = g_score[state] + step_cost(nxt)
-            if new_g < g_score.get(next_state, float("inf")):
-                g_score[next_state] = new_g
-                came_from[next_state] = state
-                ancestors[next_state] = seen | {nxt}
-                h = heuristic(nxt)
-                heapq.heappush(
-                    open_heap,
-                    (new_g + h, h, nxt[0], nxt[1], next_t, next_state),
-                )
-    result = {"path": None, "cost": None, "expanded": len(closed)}
+                continue  # static obstacle, timed obstacle, or revisit
+            new_g = g + step_cost(nxt)
+            new_path = path + (nxt,)
+            h = heuristic(nxt)
+            heapq.heappush(
+                open_heap,
+                (new_g + h, h, nx, ny, next_t, new_g, new_path,
+                 seen | {nxt}),
+            )
+    if best_key is None:
+        result = {"path": None, "cost": None, "expanded": closed_count}
+    else:
+        best_g, _, best_path = best_key
+        result = {
+            "path": list(best_path),
+            "cost": best_g,
+            "expanded": closed_count,
+        }
     if trace:
         result["expanded_nodes"] = expanded_nodes
     return result

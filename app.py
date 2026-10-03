@@ -1,7 +1,8 @@
 """Deterministic 2D grid A* planner.
 
-Public entry point: ``plan(width, height, blocked, start, goal, costs=None,
-trace=False, dynamic_blocked=None)``.
+Public entry points: ``plan(width, height, blocked, start, goal, costs=None,
+trace=False, dynamic_blocked=None)`` and ``replay(width, height, blocked,
+start, goal, path, costs=None, dynamic_blocked=None)``.
 
 Semantics:
 - Four-neighborhood moves, Manhattan heuristic. Without ``costs`` each step
@@ -66,12 +67,27 @@ Validation (all performed before the search starts):
   dimensions, out-of-bounds coordinates, endpoints on obstacles, wrong
   matrix shape, or non-positive cell costs raise ``ValueError``.
 - Duplicate blocked cells are merged without changing the result.
+
+Offline replay: ``replay(width, height, blocked, start, goal, path,
+costs=None, dynamic_blocked=None)`` re-checks a saved candidate path
+against the same rules without searching. Grid arguments are validated
+exactly as in ``plan`` (same exceptions, same order) before the path is
+examined. ``path`` must be a non-empty sequence of two-integer
+coordinates (``TypeError`` for strings/bytes/``None``/non-sequences/bad
+elements, ``ValueError`` for an empty path or out-of-bounds coordinates).
+Semantically invalid paths (wrong endpoints, static or timed obstacle
+hits, non-four-neighborhood moves, repeated coordinates, extra points
+when ``start == goal``) return ``{"valid": False, "cost": None,
+"steps": None}`` instead of raising. Valid paths return
+``{"valid": True, "cost": int, "steps": int}`` with ``cost`` recomputed
+by the same entering-cell rule as ``plan`` and ``steps == len(path) - 1``.
+No ``expanded``/``expanded_nodes`` fields are produced.
 """
 
 import heapq
 from collections.abc import Iterable, Sequence
 
-__all__ = ["plan"]
+__all__ = ["plan", "replay"]
 
 # Fixed neighbor generation order: +x, -x, +y, -y.
 _NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1))
@@ -394,3 +410,98 @@ def plan(width, height, blocked, start, goal, costs=None, trace=False,
     if trace:
         result["expanded_nodes"] = expanded_nodes
     return result
+
+
+def replay(width, height, blocked, start, goal, path, costs=None,
+           dynamic_blocked=None):
+    """Offline verification of a candidate path against the plan rules.
+
+    The grid arguments (``width``, ``height``, ``blocked``, ``start``,
+    ``goal``, ``costs``, ``dynamic_blocked``) are validated exactly as in
+    ``plan`` — same checks, same ``TypeError``/``ValueError`` boundaries,
+    same order — and all of that validation runs before the path itself is
+    examined. No search is performed and no ``expanded``/``expanded_nodes``
+    fields are produced.
+
+    ``path`` must be a non-empty sequence of grid coordinates; strings,
+    bytes, ``None``, non-sequences and elements that are not two integers
+    raise ``TypeError``, an empty path raises ``ValueError``, and
+    out-of-bounds coordinates raise ``ValueError``.
+
+    Semantically invalid paths do not raise: they return the fixed
+    structure ``{"valid": False, "cost": None, "steps": None}``. A path is
+    semantically invalid when it does not start at ``start``, does not end
+    at ``goal``, enters a static obstacle or the dynamic obstacle frame for
+    its time index (frames past the last one reuse the last frame; no
+    frames means static-only checking), moves outside the four-neighborhood,
+    repeats a coordinate, or has extra points when ``start == goal``.
+
+    A valid path returns ``{"valid": True, "cost": int, "steps": int}``
+    where ``cost`` is recomputed with the same entering-cell rule as
+    ``plan`` (unit cost without ``costs``; the start cell is never
+    counted) and ``steps`` is the number of moves, ``len(path) - 1``.
+    """
+    # --- Grid validation: identical to plan, before the path is read. ---
+    width = _validate_dimension(width, "width")
+    height = _validate_dimension(height, "height")
+    start = _normalize_point(start, "start")
+    goal = _normalize_point(goal, "goal")
+    _check_bounds(start, width, height, "start")
+    _check_bounds(goal, width, height, "goal")
+    obstacles = _normalize_blocked(blocked, width, height)
+    if start in obstacles:
+        raise ValueError(f"start {start} lies on a blocked cell")
+    if goal in obstacles:
+        raise ValueError(f"goal {goal} lies on a blocked cell")
+    costs = _normalize_costs(costs, width, height)
+    frames = _normalize_dynamic_blocked(dynamic_blocked, width, height)
+    if frames is not None and start in frames[0]:
+        raise ValueError(
+            f"start {start} is blocked at frame 0"
+        )
+
+    # --- Path structure validation. ---
+    if isinstance(path, (str, bytes)) or not isinstance(path, Sequence):
+        raise TypeError(
+            f"path must be a non-empty sequence of grid coordinates, "
+            f"got {type(path).__name__}"
+        )
+    if len(path) == 0:
+        raise ValueError("path must not be empty")
+    points = []
+    for index, item in enumerate(path):
+        name = f"path[{index}]"
+        point = _normalize_point(item, name)
+        _check_bounds(point, width, height, name)
+        points.append(point)
+
+    invalid = {"valid": False, "cost": None, "steps": None}
+
+    # --- Semantic checks: any violation yields the fixed invalid result. ---
+    if points[0] != start or points[-1] != goal:
+        return invalid
+    if start == goal and len(points) > 1:
+        return invalid  # extra points on a zero-move route
+    if len(set(points)) != len(points):
+        return invalid  # repeated coordinate
+    if frames is not None:
+        last_frame = len(frames) - 1
+        for t, point in enumerate(points):
+            if point in obstacles:
+                return invalid
+            frame = frames[t] if t <= last_frame else frames[last_frame]
+            if point in frame:
+                return invalid
+    else:
+        for point in points:
+            if point in obstacles:
+                return invalid
+    for a, b in zip(points, points[1:]):
+        if abs(a[0] - b[0]) + abs(a[1] - b[1]) != 1:
+            return invalid  # not a four-neighborhood move
+
+    if costs is None:
+        cost = len(points) - 1
+    else:
+        cost = sum(costs[y][x] for x, y in points[1:])
+    return {"valid": True, "cost": cost, "steps": len(points) - 1}

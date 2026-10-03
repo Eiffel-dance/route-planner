@@ -37,3 +37,13 @@ Tests: python3 -m unittest discover -s tests -v
 - 返回总代价最小的可行路径；总代价相同时，固定优先级依次为 f、h、x、y、t，仍相同时按完整坐标路径的字典序决定取舍，因此结果不依赖障碍集合、帧内坐标顺序或遍历顺序。
 - 动态模式下 `expanded_nodes` 按实际关闭顺序记录 `(x, y, t)` 三元组，`expanded` 按条目计数；被丢弃的候选不记录。同一 `(x, y, t)` 若由不同历史分别关闭，其三元组按关闭顺序分别出现，`expanded` 逐条计数。不可达时 `path`/`cost` 为 `None`。
 - 校验：外层必须是序列，每一帧必须是可迭代坐标集合；字符串/字节串、非二整数坐标抛出 `TypeError`，越界坐标抛出 `ValueError`，帧内重复坐标合并；`start` 在第 0 帧被禁止时抛出 `ValueError`。所有校验在搜索开始前完成，既有校验顺序不变。
+
+**离线回放（`replay`）**
+
+`replay(width, height, blocked, start, goal, path, costs=None, dynamic_blocked=None)` 在不执行搜索的前提下核验一条已保存的候选路径并重算代价，不返回 `expanded` 或 `expanded_nodes` 字段。
+
+- 网格参数（`width`、`height`、`blocked`、`start`、`goal`、`costs`、`dynamic_blocked`）使用与 `plan` 完全相同的公开校验、相同的 `TypeError`/`ValueError` 边界和相同的校验顺序，且全部发生在路径判定之前；未调用 `replay` 时 `plan` 的任何既有行为不变。
+- `path` 必须是非空坐标序列：字符串、字节串、`None`、非序列或元素不是两个整数时抛出 `TypeError`；空路径或坐标越界时抛出 `ValueError`。
+- 返回固定结构。合规时返回 `{"valid": True, "cost": int, "steps": int}`：`cost` 按与 `plan` 一致的进入格子规则重算（无 `costs` 时为单位代价，起点格子代价不计入），`steps` 为移动次数，等于 `len(path) - 1`。
+- 语义上无效的路径不抛异常，返回 `{"valid": False, "cost": None, "steps": None}`，不返回部分累计值。无效情形包括：未从 `start` 开始、未在 `goal` 结束、经过静态障碍或对应时间帧的动态障碍、相邻点不是四邻域、出现重复坐标，以及 `start == goal` 却包含多余点。
+- 动态时间索引规则与 `plan` 一致：`dynamic_blocked` 省略、为 `None` 或为空序列时按静态模式检查；路径下标 `t` 处的坐标必须避开第 `t` 帧，超过最后一帧后持续使用最后一帧。

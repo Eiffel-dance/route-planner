@@ -1,7 +1,7 @@
 import unittest
 
 import app
-from app import plan
+from app import plan, replay
 
 
 class PathSemanticsTest(unittest.TestCase):
@@ -401,6 +401,110 @@ class DynamicPlannerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             plan(0, 3, set(), (0, 0), (1, 1), trace=1,
                  dynamic_blocked=[[]])
+
+
+class ReplayTest(unittest.TestCase):
+    BLOCKED = {(2, 0), (2, 1), (2, 2)}
+    INVALID = {"valid": False, "cost": None, "steps": None}
+
+    def test_valid_static_path_matches_plan(self):
+        result = plan(6, 4, self.BLOCKED, (0, 0), (5, 3))
+        check = replay(6, 4, self.BLOCKED, (0, 0), (5, 3), result["path"])
+        self.assertEqual(check, {"valid": True, "cost": result["cost"],
+                                 "steps": len(result["path"]) - 1})
+        self.assertNotIn("expanded", check)
+        self.assertNotIn("expanded_nodes", check)
+
+    def test_valid_path_with_costs(self):
+        costs = [[1, 10, 1], [1, 10, 1], [1, 1, 1]]
+        result = plan(3, 3, set(), (0, 0), (2, 0), costs=costs)
+        check = replay(3, 3, set(), (0, 0), (2, 0), result["path"],
+                       costs=costs)
+        expected = sum(costs[y][x] for x, y in result["path"][1:])
+        self.assertEqual(check, {"valid": True, "cost": expected,
+                                 "steps": len(result["path"]) - 1})
+        self.assertEqual(check["cost"], result["cost"])
+
+    def test_valid_dynamic_path_and_last_frame_persistence(self):
+        frames = [[], [(1, 0)]]
+        result = plan(3, 3, set(), (0, 0), (2, 0), dynamic_blocked=frames)
+        check = replay(3, 3, set(), (0, 0), (2, 0), result["path"],
+                       dynamic_blocked=frames)
+        self.assertEqual(check, {"valid": True, "cost": 4, "steps": 4})
+        # The single frame persists: (1, 0) stays blocked at t >= 1.
+        through_blocked = [(0, 0), (1, 0), (2, 0)]
+        self.assertEqual(replay(3, 3, set(), (0, 0), (2, 0), through_blocked,
+                                dynamic_blocked=frames), self.INVALID)
+
+    def test_empty_dynamic_blocked_uses_static_checking(self):
+        path = [(0, 0), (1, 0), (2, 0)]
+        for kwargs in ({}, {"dynamic_blocked": None},
+                       {"dynamic_blocked": []}):
+            self.assertEqual(
+                replay(3, 1, set(), (0, 0), (2, 0), path, **kwargs),
+                {"valid": True, "cost": 2, "steps": 2},
+            )
+
+    def test_start_equals_goal(self):
+        self.assertEqual(replay(3, 3, set(), (1, 1), (1, 1), [(1, 1)]),
+                         {"valid": True, "cost": 0, "steps": 0})
+        # Extra points on a zero-move route are invalid.
+        self.assertEqual(
+            replay(3, 3, set(), (1, 1), (1, 1), [(1, 1), (1, 2), (1, 1)]),
+            self.INVALID,
+        )
+
+    def test_semantically_invalid_paths_return_fixed_structure(self):
+        base = (6, 4, self.BLOCKED, (0, 0), (5, 3))
+        good = plan(*base)["path"]
+        cases = [
+            [(1, 0)] + good[1:],          # does not start at start
+            good[:-1] + [(5, 2)],         # does not end at goal
+            [(0, 0), (1, 0), (2, 0), (2, 1), (3, 1), (4, 1), (5, 1),
+             (5, 2), (5, 3)],             # crosses static obstacle (2, 0)
+            [(0, 0), (2, 0)],             # not a four-neighborhood move
+            [(0, 0), (1, 0), (0, 0)],     # repeated coordinate
+        ]
+        for path in cases:
+            with self.subTest(path=path):
+                self.assertEqual(replay(*base, path), self.INVALID)
+
+    def test_path_type_errors(self):
+        for bad in ("ab", b"ab", None, 42, [(0, 0), "xy"],
+                    [(0, 0), (1,)], [(0, 0), (1.5, 2)],
+                    [(0, 0), (True, 0)]):
+            with self.assertRaises(TypeError, msg=f"path={bad!r}"):
+                replay(3, 3, set(), (0, 0), (2, 2), bad)
+
+    def test_path_value_errors(self):
+        with self.assertRaises(ValueError):
+            replay(3, 3, set(), (0, 0), (2, 2), [])
+        for bad in ([(0, 0), (3, 0)], [(-1, 0), (0, 0)], [(0, 0), (0, 3)]):
+            with self.assertRaises(ValueError, msg=f"path={bad!r}"):
+                replay(3, 3, set(), (0, 0), (2, 2), bad)
+
+    def test_grid_validation_before_path_and_unchanged(self):
+        # Grid errors raise exactly as in plan, even with an invalid path.
+        with self.assertRaises(TypeError):
+            replay("3", 3, set(), (0, 0), (2, 2), "nope")
+        with self.assertRaises(ValueError):
+            replay(0, 3, set(), (0, 0), (2, 2), [(0, 0)])
+        with self.assertRaises(ValueError):
+            replay(3, 3, {(0, 0)}, (0, 0), (2, 2), [(0, 0)])
+        with self.assertRaises(ValueError):
+            replay(3, 3, set(), (0, 0), (2, 2), [(0, 0)],
+                   dynamic_blocked=[[(0, 0)]])
+        with self.assertRaises(TypeError):
+            replay(3, 3, set(), (0, 0), (2, 2), [(0, 0)],
+                   dynamic_blocked=42)
+
+    def test_replay_does_not_change_plan_behavior(self):
+        blocked = {(2, 0), (2, 1), (2, 2), (0, 2), (4, 1)}
+        expected = plan(6, 4, blocked, (0, 0), (5, 3))
+        check = replay(6, 4, blocked, (0, 0), (5, 3), expected["path"])
+        self.assertEqual(check, {"valid": True, "cost": expected["cost"],
+                                 "steps": len(expected["path"]) - 1})
+        self.assertEqual(plan(6, 4, blocked, (0, 0), (5, 3)), expected)
 
 
 if __name__ == '__main__':

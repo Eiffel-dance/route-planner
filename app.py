@@ -1,8 +1,9 @@
 """Deterministic 2D grid A* planner.
 
 Public entry points: ``plan(width, height, blocked, start, goal, costs=None,
-trace=False, dynamic_blocked=None)`` and ``replay(width, height, blocked,
-start, goal, path, costs=None, dynamic_blocked=None, diagnose=False)``.
+trace=False, dynamic_blocked=None, max_expanded=None)`` and
+``replay(width, height, blocked, start, goal, path, costs=None,
+dynamic_blocked=None, diagnose=False)``.
 
 Semantics:
 - Four-neighborhood moves, Manhattan heuristic. Without ``costs`` each step
@@ -22,6 +23,16 @@ Semantics:
   time, in expansion order (includes the start, and the goal on success);
   ``expanded == len(expanded_nodes)``. The field is omitted entirely when
   ``trace`` is false or omitted.
+- When ``max_expanded`` is provided, every result additionally carries
+  ``status``: ``"found"`` when the goal is closed within the budget,
+  ``"unreachable"`` when the candidates run out without a goal, and
+  ``"budget_exhausted"`` when the limit on newly closed nodes is reached
+  with candidates still open and no goal ever closed. In that last case
+  ``path`` and ``cost`` are ``None`` and ``expanded`` is the number of
+  nodes actually closed (``max_expanded``); ``trace`` records exactly
+  those closings, never a fabricated start. Omitting ``max_expanded`` or
+  passing ``None`` leaves every key, value and exception identical to the
+  unbudgeted behavior (no ``status`` field).
 
 Dynamic obstacles (``dynamic_blocked``):
 - ``dynamic_blocked`` may be omitted, ``None`` or an empty sequence, which
@@ -103,6 +114,12 @@ Validation (all performed before the search starts):
   sequence of ``height`` rows, each a sequence of ``width`` positive
   integers; strings/bytes, non-integer cells and booleans are rejected.
 - ``trace`` must be a bool; non-bool values raise ``TypeError``.
+- ``max_expanded`` may be omitted or ``None`` (unlimited). Otherwise it
+  must be a non-negative integer and not a bool; booleans and other
+  non-integers raise ``TypeError`` and negative values raise
+  ``ValueError``. These checks run after every grid, ``costs``,
+  ``trace`` and ``dynamic_blocked`` check (including the frame-0 check)
+  and before the search starts.
 - Type or structure violations raise ``TypeError``; non-positive
   dimensions, out-of-bounds coordinates, endpoints on obstacles, wrong
   matrix shape, or non-positive cell costs raise ``ValueError``.
@@ -260,7 +277,7 @@ def _normalize_path(path, width, height):
 
 
 def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
-                    trace):
+                    trace, budget=None):
     """History-sensitive time-expanded A*.
 
     Frame ``t`` constrains the cell occupied at path index ``t``; frames
@@ -295,7 +312,17 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
     h0 = heuristic(start)
     if start == goal:
         # Single-point, zero-cost result; frame 0 was checked upstream.
+        # With a zero budget nothing may be closed, so the start is not
+        # recorded even when it is the goal.
+        if budget is not None and budget <= 0:
+            result = {"path": None, "cost": None, "expanded": 0,
+                      "status": "budget_exhausted"}
+            if trace:
+                result["expanded_nodes"] = []
+            return result
         result = {"path": [start], "cost": 0, "expanded": 1}
+        if budget is not None:
+            result["status"] = "found"
         if trace:
             result["expanded_nodes"] = [(start[0], start[1], 0)]
         return result
@@ -321,8 +348,15 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
     # exceeds the best goal cost, no route of that cost (or less) can
     # remain undiscovered.
     best_key = None
+    # When a budget is given, searching stops as soon as another closing
+    # would exceed it. A goal already closed still settles as ``found``
+    # against the closings within the fixed prefix.
+    stopped_by_budget = False
 
     while open_heap:
+        if budget is not None and closed_count >= budget:
+            stopped_by_budget = True
+            break
         if best_key is not None and open_heap[0][0] > best_key[0]:
             break
         _, _, x, y, t, g, path, seen = heapq.heappop(open_heap)
@@ -353,8 +387,13 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
                 (new_g + h, h, nx, ny, next_t, new_g, new_path,
                  seen | {nxt}),
             )
-    if best_key is None:
+    if stopped_by_budget and best_key is None:
+        result = {"path": None, "cost": None, "expanded": closed_count,
+                  "status": "budget_exhausted"}
+    elif best_key is None:
         result = {"path": None, "cost": None, "expanded": closed_count}
+        if budget is not None:
+            result["status"] = "unreachable"
     else:
         best_g, _, best_path = best_key
         result = {
@@ -362,13 +401,15 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
             "cost": best_g,
             "expanded": closed_count,
         }
+        if budget is not None:
+            result["status"] = "found"
     if trace:
         result["expanded_nodes"] = expanded_nodes
     return result
 
 
 def plan(width, height, blocked, start, goal, costs=None, trace=False,
-         dynamic_blocked=None):
+         dynamic_blocked=None, max_expanded=None):
     # --- Validation: everything is checked before the search begins. ---
     width = _validate_dimension(width, "width")
     height = _validate_dimension(height, "height")
@@ -392,8 +433,21 @@ def plan(width, height, blocked, start, goal, costs=None, trace=False,
             raise ValueError(
                 f"start {start} is blocked at frame 0"
             )
+    if max_expanded is not None:
+        if not _is_int(max_expanded):
+            raise TypeError(
+                "max_expanded must be a non-negative int, got "
+                f"{type(max_expanded).__name__}"
+            )
+        if max_expanded < 0:
+            raise ValueError(
+                f"max_expanded must be a non-negative integer, got "
+                f"{max_expanded}"
+            )
+    if frames is not None:
         return _search_dynamic(
-            width, height, obstacles, frames, start, goal, costs, trace
+            width, height, obstacles, frames, start, goal, costs, trace,
+            max_expanded,
         )
 
     def heuristic(point):
@@ -418,7 +472,20 @@ def plan(width, height, blocked, start, goal, costs=None, trace=False,
     while open_heap:
         _, _, _, _, current = heapq.heappop(open_heap)
         if current in closed:
-            continue  # stale heap entry; already closed with its best g
+            continue  # stale entry: skipped without spending budget
+        if max_expanded is not None and len(closed) >= max_expanded:
+            # A genuine candidate remains open but closing it would
+            # exceed the limit, so stop exactly here. Heap entries that
+            # were stale have already been drained above.
+            result = {
+                "path": None,
+                "cost": None,
+                "expanded": len(closed),
+                "status": "budget_exhausted",
+            }
+            if trace:
+                result["expanded_nodes"] = expanded_nodes
+            return result
         closed.add(current)
         if expanded_nodes is not None:
             expanded_nodes.append(current)
@@ -432,6 +499,8 @@ def plan(width, height, blocked, start, goal, costs=None, trace=False,
                 "cost": g_score[current],
                 "expanded": len(closed),
             }
+            if max_expanded is not None:
+                result["status"] = "found"
             if trace:
                 result["expanded_nodes"] = expanded_nodes
             return result
@@ -450,6 +519,8 @@ def plan(width, height, blocked, start, goal, costs=None, trace=False,
                     open_heap, (new_g + h, h, nxt[0], nxt[1], nxt)
                 )
     result = {"path": None, "cost": None, "expanded": len(closed)}
+    if max_expanded is not None:
+        result["status"] = "unreachable"
     if trace:
         result["expanded_nodes"] = expanded_nodes
     return result

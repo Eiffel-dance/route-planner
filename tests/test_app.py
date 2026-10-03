@@ -403,6 +403,389 @@ class DynamicPlannerTest(unittest.TestCase):
                  dynamic_blocked=[[]])
 
 
+class MaxExpandedTest(unittest.TestCase):
+    BLOCKED = {(2, 0), (2, 1), (2, 2), (0, 2), (4, 1)}
+    HISTORY_FRAMES = [
+        [(0, 1), (0, 2)],
+        [(0, 1), (1, 2), (2, 0), (2, 2)],
+        [(2, 1), (2, 2)],
+        [(0, 0), (1, 2), (2, 1), (2, 2)],
+        [],
+        [(0, 1)],
+    ]
+
+    # --- backward compatibility: omitting the budget changes nothing ---
+
+    def test_none_budget_identical_to_omission(self):
+        blocked = self.BLOCKED
+        cases = (
+            dict(args=(6, 4, blocked, (0, 0), (5, 3)), kwargs={}),
+            dict(args=(6, 4, blocked, (0, 0), (5, 3)),
+                 kwargs={"trace": True}),
+            dict(args=(3, 3, {(1, y) for y in range(3)}, (0, 0), (2, 2)),
+                 kwargs={"trace": True}),
+            dict(args=(3, 3, set(), (0, 0), (2, 0)),
+                 kwargs={"dynamic_blocked": [[], [(1, 0)]]}),
+            dict(args=(2, 2, set(), (0, 0), (1, 1)),
+                 kwargs={"trace": True,
+                         "dynamic_blocked": [[], [(1, 0), (0, 1)]]}),
+        )
+        for case in cases:
+            args, kwargs = case["args"], case["kwargs"]
+            omitted = plan(*args, **kwargs)
+            explicit = plan(*args, max_expanded=None, **kwargs)
+            self.assertEqual(explicit, omitted)
+            self.assertNotIn("status", omitted)
+
+    # --- validation ---
+
+    def test_budget_type_errors(self):
+        for bad in (True, False, 1.0, 0.0, "2", [2], (2,), object()):
+            with self.assertRaises(TypeError, msg=f"max_expanded={bad!r}"):
+                plan(3, 3, set(), (0, 0), (2, 2), max_expanded=bad)
+
+    def test_budget_negative_value_errors(self):
+        for bad in (-1, -2, -100):
+            with self.assertRaises(ValueError, msg=f"max_expanded={bad}"):
+                plan(3, 3, set(), (0, 0), (2, 2), max_expanded=bad)
+
+    def test_zero_budget_accepted(self):
+        result = plan(3, 3, set(), (0, 0), (2, 2), max_expanded=0)
+        self.assertEqual(result["status"], "budget_exhausted")
+
+    def test_budget_checks_run_after_all_existing_checks(self):
+        # Width ValueError precedes the budget TypeError/ValueError.
+        with self.assertRaises(ValueError):
+            plan(0, 3, set(), (0, 0), (1, 1), max_expanded=True)
+        with self.assertRaises(ValueError):
+            plan(0, 3, set(), (0, 0), (1, 1), max_expanded=-1)
+        # Endpoint obstacle ValueError precedes budget validation.
+        with self.assertRaises(ValueError):
+            plan(3, 3, {(0, 0)}, (0, 0), (2, 2), max_expanded=True)
+        # costs TypeError precedes budget validation.
+        with self.assertRaises(TypeError):
+            plan(3, 3, set(), (0, 0), (2, 2), costs=42, max_expanded=True)
+        # trace TypeError precedes budget validation.
+        with self.assertRaises(TypeError):
+            plan(3, 3, set(), (0, 0), (2, 2), trace=1, max_expanded=True)
+        # dynamic_blocked TypeError precedes budget validation.
+        with self.assertRaises(TypeError):
+            plan(3, 3, set(), (0, 0), (2, 2),
+                 dynamic_blocked=42, max_expanded=True)
+        # Frame-0 ValueError precedes budget validation.
+        with self.assertRaises(ValueError):
+            plan(3, 3, set(), (0, 0), (2, 2),
+                 dynamic_blocked=[[(0, 0)]], max_expanded=True)
+        # But once the grid is valid the budget is rejected before search.
+        with self.assertRaises(TypeError):
+            plan(3, 3, set(), (0, 0), (2, 2),
+                 dynamic_blocked=[[]], max_expanded="x")
+
+    # --- static search ---
+
+    def test_static_found_within_budget(self):
+        full = plan(6, 4, self.BLOCKED, (0, 0), (5, 3), trace=True)
+        result = plan(6, 4, self.BLOCKED, (0, 0), (5, 3),
+                      max_expanded=full["expanded"] + 10)
+        self.assertEqual(result["status"], "found")
+        self.assertEqual(result["path"], full["path"])
+        self.assertEqual(result["cost"], full["cost"])
+        self.assertEqual(result["expanded"], full["expanded"])
+        self.assertEqual(set(result), {"path", "cost", "expanded",
+                                       "status"})
+
+    def test_static_exact_budget_found_identical_trace(self):
+        full = plan(6, 4, self.BLOCKED, (0, 0), (5, 3), trace=True)
+        exact = plan(6, 4, self.BLOCKED, (0, 0), (5, 3), trace=True,
+                     max_expanded=full["expanded"])
+        self.assertEqual(exact["status"], "found")
+        self.assertEqual(exact["path"], full["path"])
+        self.assertEqual(exact["cost"], full["cost"])
+        self.assertEqual(exact["expanded"], full["expanded"])
+        self.assertEqual(exact["expanded_nodes"], full["expanded_nodes"])
+        self.assertEqual(set(exact), {"path", "cost", "expanded",
+                                      "status", "expanded_nodes"})
+
+    def test_static_budget_exhausted_structure(self):
+        full = plan(6, 4, self.BLOCKED, (0, 0), (5, 3), trace=True)
+        cut = plan(6, 4, self.BLOCKED, (0, 0), (5, 3), trace=True,
+                   max_expanded=3)
+        self.assertEqual(cut, {
+            "path": None,
+            "cost": None,
+            "expanded": 3,
+            "status": "budget_exhausted",
+            "expanded_nodes": full["expanded_nodes"][:3],
+        })
+        self.assertEqual(cut["expanded_nodes"][0], (0, 0))
+        # Without trace the field is absent even on a budget stop.
+        plain = plan(6, 4, self.BLOCKED, (0, 0), (5, 3),
+                     max_expanded=3)
+        self.assertEqual(set(plain),
+                         {"path", "cost", "expanded", "status"})
+
+    def test_static_zero_budget_closes_nothing(self):
+        result = plan(6, 4, self.BLOCKED, (0, 0), (5, 3), trace=True,
+                      max_expanded=0)
+        self.assertEqual(result, {
+            "path": None, "cost": None, "expanded": 0,
+            "status": "budget_exhausted", "expanded_nodes": [],
+        })
+
+    def test_static_start_equals_goal_zero_budget(self):
+        result = plan(3, 3, set(), (1, 1), (1, 1), trace=True,
+                      max_expanded=0)
+        self.assertEqual(result, {
+            "path": None, "cost": None, "expanded": 0,
+            "status": "budget_exhausted", "expanded_nodes": [],
+        })
+
+    def test_static_start_equals_goal_positive_budget_single_point(self):
+        for budget in (1, 2, 10):
+            result = plan(3, 3, set(), (1, 1), (1, 1), trace=True,
+                          max_expanded=budget)
+            self.assertEqual(result, {
+                "path": [(1, 1)], "cost": 0, "expanded": 1,
+                "status": "found", "expanded_nodes": [(1, 1)],
+            })
+
+    def test_static_unreachable_vs_budget_exhausted(self):
+        wall = {(1, y) for y in range(3)}
+        done = plan(3, 3, wall, (0, 0), (2, 2), trace=True,
+                    max_expanded=100)
+        self.assertEqual(done, {
+            "path": None, "cost": None, "expanded": 3,
+            "status": "unreachable",
+            "expanded_nodes": [(0, 0), (0, 1), (0, 2)],
+        })
+        tight = plan(3, 3, wall, (0, 0), (2, 2), trace=True,
+                     max_expanded=2)
+        self.assertEqual(tight, {
+            "path": None, "cost": None, "expanded": 2,
+            "status": "budget_exhausted",
+            "expanded_nodes": [(0, 0), (0, 1)],
+        })
+
+    def test_static_stale_entries_drained_without_spending_budget(self):
+        # Non-uniform costs make some heap entries stale (a cell first
+        # reached through a costly route). When only stale entries remain
+        # after the reachable region is exhausted, the result is
+        # unreachable, not budget_exhausted.
+        seal = {(2, y) for y in range(3)}
+        costs = [
+            [1, 100, 1, 1, 1],
+            [1, 1, 1, 1, 1],
+            [100, 1, 1, 1, 1],
+        ]
+        free_run = plan(5, 3, seal, (0, 0), (4, 2), costs=costs)
+        self.assertIsNone(free_run["path"])
+        result = plan(5, 3, seal, (0, 0), (4, 2), costs=costs,
+                      max_expanded=free_run["expanded"])
+        self.assertEqual(result["status"], "unreachable")
+        self.assertEqual(result["expanded"], free_run["expanded"])
+        one_short = plan(5, 3, seal, (0, 0), (4, 2), costs=costs,
+                         max_expanded=free_run["expanded"] - 1)
+        self.assertEqual(one_short["status"], "budget_exhausted")
+
+    def test_static_budget_with_costs(self):
+        costs = [[1, 10, 1], [1, 10, 1], [1, 1, 1]]
+        full = plan(3, 3, set(), (0, 0), (2, 0), costs=costs, trace=True)
+        found = plan(3, 3, set(), (0, 0), (2, 0), costs=costs,
+                     trace=True, max_expanded=full["expanded"])
+        self.assertEqual(found["status"], "found")
+        self.assertEqual(found["path"], full["path"])
+        self.assertEqual(found["cost"], full["cost"])
+        stopped = plan(3, 3, set(), (0, 0), (2, 0), costs=costs,
+                       max_expanded=1)
+        self.assertEqual(stopped["status"], "budget_exhausted")
+        self.assertIsNone(stopped["path"])
+
+    # --- dynamic search ---
+
+    def test_dynamic_found_within_budget(self):
+        frames = [[], [(1, 0)]]
+        full = plan(3, 3, set(), (0, 0), (2, 0),
+                    dynamic_blocked=frames, trace=True)
+        result = plan(3, 3, set(), (0, 0), (2, 0),
+                      dynamic_blocked=frames,
+                      max_expanded=full["expanded"] + 5)
+        self.assertEqual(result["status"], "found")
+        self.assertEqual(result["path"], full["path"])
+        self.assertEqual(result["cost"], full["cost"])
+        self.assertEqual(result["expanded"], full["expanded"])
+
+    def test_dynamic_zero_budget_closes_nothing(self):
+        frames = [[], [(1, 0)]]
+        result = plan(3, 3, set(), (0, 0), (2, 0),
+                      dynamic_blocked=frames, trace=True, max_expanded=0)
+        self.assertEqual(result, {
+            "path": None, "cost": None, "expanded": 0,
+            "status": "budget_exhausted", "expanded_nodes": [],
+        })
+
+    def test_dynamic_budget_exhausted_prefix(self):
+        frames = [[], [(1, 0)]]
+        full = plan(3, 3, set(), (0, 0), (2, 0),
+                    dynamic_blocked=frames, trace=True)
+        cut = plan(3, 3, set(), (0, 0), (2, 0),
+                   dynamic_blocked=frames, trace=True, max_expanded=1)
+        self.assertEqual(cut["status"], "budget_exhausted")
+        self.assertIsNone(cut["path"])
+        self.assertIsNone(cut["cost"])
+        self.assertEqual(cut["expanded"], 1)
+        self.assertEqual(cut["expanded_nodes"],
+                         full["expanded_nodes"][:1])
+        self.assertEqual(cut["expanded_nodes"], [(0, 0, 0)])
+
+    def test_dynamic_candidates_exhausted_is_unreachable(self):
+        # Frame 1 blocks every neighbor of the start.
+        frames = [[], [(1, 0), (0, 1)]]
+        for budget in (1, 2, 10):
+            result = plan(2, 2, set(), (0, 0), (1, 1),
+                          dynamic_blocked=frames, trace=True,
+                          max_expanded=budget)
+            self.assertEqual(result, {
+                "path": None, "cost": None, "expanded": 1,
+                "status": "unreachable",
+                "expanded_nodes": [(0, 0, 0)],
+            })
+
+    def test_dynamic_start_equals_goal_budget(self):
+        frames = [[], [(0, 0)]]
+        zero = plan(3, 3, set(), (1, 1), (1, 1), trace=True,
+                    dynamic_blocked=frames, max_expanded=0)
+        self.assertEqual(zero, {
+            "path": None, "cost": None, "expanded": 0,
+            "status": "budget_exhausted", "expanded_nodes": [],
+        })
+        one = plan(3, 3, set(), (1, 1), (1, 1), trace=True,
+                   dynamic_blocked=frames, max_expanded=1)
+        self.assertEqual(one, {
+            "path": [(1, 1)], "cost": 0, "expanded": 1,
+            "status": "found", "expanded_nodes": [(1, 1, 0)],
+        })
+
+    def test_dynamic_goal_closed_before_cut_is_found_and_replays(self):
+        full = plan(3, 3, set(), (1, 0), (2, 2), trace=True,
+                    dynamic_blocked=self.HISTORY_FRAMES)
+        nodes = full["expanded_nodes"]
+        first_goal = next(i for i, triple in enumerate(nodes)
+                          if triple[:2] == (2, 2)) + 1
+        result = plan(3, 3, set(), (1, 0), (2, 2), trace=True,
+                      dynamic_blocked=self.HISTORY_FRAMES,
+                      max_expanded=first_goal)
+        self.assertEqual(result["status"], "found")
+        self.assertEqual(result["expanded"], first_goal)
+        self.assertEqual(result["expanded_nodes"], nodes[:first_goal])
+        checked = replay(3, 3, set(), (1, 0), (2, 2), result["path"],
+                         dynamic_blocked=self.HISTORY_FRAMES)
+        self.assertTrue(checked["valid"])
+        self.assertEqual(checked["cost"], result["cost"])
+
+    def test_dynamic_every_cut_is_an_exact_prefix(self):
+        full = plan(3, 3, set(), (1, 0), (2, 2), trace=True,
+                    dynamic_blocked=self.HISTORY_FRAMES)
+        nodes = full["expanded"]
+        for k in range(0, nodes + 1):
+            cut = plan(3, 3, set(), (1, 0), (2, 2), trace=True,
+                       dynamic_blocked=self.HISTORY_FRAMES,
+                       max_expanded=k)
+            self.assertEqual(cut["expanded"], k)
+            self.assertEqual(cut["expanded_nodes"],
+                             full["expanded_nodes"][:k])
+            self.assertIn(cut["status"],
+                          ("found", "unreachable", "budget_exhausted"))
+            if cut["status"] == "budget_exhausted":
+                self.assertIsNone(cut["path"])
+                self.assertIsNone(cut["cost"])
+
+    def test_dynamic_budget_with_costs(self):
+        costs = [[1, 1, 1], [1, 1, 100], [1, 1, 1]]
+        result = plan(3, 3, set(), (1, 0), (2, 2), costs=costs,
+                      dynamic_blocked=self.HISTORY_FRAMES,
+                      max_expanded=1000)
+        self.assertEqual(result["status"], "found")
+        self.assertEqual(result["cost"],
+                         sum(costs[y][x] for x, y in result["path"][1:]))
+        zero = plan(3, 3, set(), (1, 0), (2, 2), costs=costs,
+                    dynamic_blocked=self.HISTORY_FRAMES,
+                    max_expanded=0, trace=True)
+        self.assertEqual(zero["status"], "budget_exhausted")
+        self.assertEqual(zero["expanded_nodes"], [])
+
+    def test_budgeted_dynamic_result_independent_of_input_order(self):
+        orders = [
+            self.HISTORY_FRAMES,
+            [list(reversed(f)) for f in self.HISTORY_FRAMES],
+            [set(f) for f in self.HISTORY_FRAMES],
+        ]
+        for budget in (0, 1, 7, 20):
+            first = plan(3, 3, set(), (1, 0), (2, 2), trace=True,
+                         dynamic_blocked=orders[0], max_expanded=budget)
+            for frames in orders[1:]:
+                self.assertEqual(
+                    plan(3, 3, set(), (1, 0), (2, 2), trace=True,
+                         dynamic_blocked=frames, max_expanded=budget),
+                    first,
+                )
+
+    # --- replay is untouched by the budget ---
+
+    def test_replay_has_no_budget_parameter(self):
+        with self.assertRaises(TypeError):
+            replay(3, 3, set(), (0, 0), (2, 2),
+                   [(0, 0), (1, 0), (2, 0)], max_expanded=1)
+
+    def test_replay_accepts_paths_budget_search_would_not_reach(self):
+        # A path the zero-budget search cannot find still replays fine.
+        result = replay(3, 3, set(), (0, 0), (2, 2),
+                        [(0, 0), (0, 1), (0, 2), (1, 2), (2, 2)])
+        self.assertEqual(result, {"valid": True, "cost": 4, "steps": 4})
+        self.assertNotIn("status", result)
+
+    def test_random_grids_prefix_and_status_invariants(self):
+        import random
+        rng = random.Random(8675309)
+        for _ in range(60):
+            w, h = rng.randint(1, 5), rng.randint(1, 5)
+            cells = [(x, y) for y in range(h) for x in range(w)]
+            blocked = {p for p in cells[1:-1] if rng.random() < 0.25}
+            start, goal = cells[0], cells[-1]
+            if start in blocked or goal in blocked:
+                continue
+            kwargs = {}
+            if rng.random() < 0.5:
+                kwargs["costs"] = [[rng.randint(1, 9) for _ in range(w)]
+                                   for _ in range(h)]
+            if rng.random() < 0.5:
+                frames = [[p for p in cells if rng.random() < 0.25]
+                          for _ in range(rng.randint(1, w + h))]
+                frames[0] = [p for p in frames[0] if p != start]
+                kwargs["dynamic_blocked"] = frames
+            full = plan(w, h, blocked, start, goal, trace=True, **kwargs)
+            total = full["expanded"]
+            for k in range(0, total + 1):
+                cut = plan(w, h, blocked, start, goal, trace=True,
+                           max_expanded=k, **kwargs)
+                self.assertEqual(cut["expanded_nodes"],
+                                 full["expanded_nodes"][:k])
+                self.assertEqual(cut["expanded"],
+                                 len(cut["expanded_nodes"]))
+                if cut["status"] == "found":
+                    self.assertIsNotNone(cut["path"])
+                    checked = replay(w, h, blocked, start, goal,
+                                     cut["path"], **kwargs)
+                    self.assertTrue(checked["valid"])
+                    self.assertEqual(checked["cost"], cut["cost"])
+                elif cut["status"] == "budget_exhausted":
+                    self.assertIsNone(cut["path"])
+                    self.assertIsNone(cut["cost"])
+                else:
+                    self.assertEqual(cut["status"], "unreachable")
+                    self.assertIsNone(full["path"])
+                    self.assertEqual(cut["expanded"], total)
+
+
 class ReplayTest(unittest.TestCase):
     INVALID = {"valid": False, "cost": None, "steps": None}
 

@@ -638,5 +638,209 @@ class ReplayTest(unittest.TestCase):
             self.assertEqual(result["steps"], len(planned["path"]) - 1)
 
 
+class ReplayDiagnoseTest(unittest.TestCase):
+    def test_false_or_omitted_keeps_exact_legacy_shape(self):
+        path = [(0, 0), (0, 1), (1, 1), (2, 1), (2, 0)]
+        omitted = replay(3, 3, set(), (0, 0), (2, 0), path)
+        explicit = replay(3, 3, set(), (0, 0), (2, 0), path, diagnose=False)
+        self.assertEqual(explicit, omitted)
+        self.assertEqual(set(omitted), {"valid", "cost", "steps"})
+        # Invalid paths keep the exact legacy structure too.
+        bad = [(0, 1), (1, 1), (2, 1), (2, 0)]
+        self.assertEqual(
+            replay(3, 3, set(), (0, 0), (2, 0), bad),
+            replay(3, 3, set(), (0, 0), (2, 0), bad, diagnose=False),
+        )
+        self.assertEqual(
+            set(replay(3, 3, set(), (0, 0), (2, 0), bad)),
+            {"valid", "cost", "steps"},
+        )
+
+    def test_valid_path_reports_none_error_fields(self):
+        blocked = {(2, 0), (2, 1), (2, 2)}
+        planned = plan(6, 4, blocked, (0, 0), (5, 3))
+        result = replay(6, 4, blocked, (0, 0), (5, 3), planned["path"],
+                        diagnose=True)
+        self.assertEqual(result, {
+            "valid": True,
+            "cost": planned["cost"],
+            "steps": len(planned["path"]) - 1,
+            "error": None,
+            "error_index": None,
+        })
+
+    def test_valid_single_point_route(self):
+        self.assertEqual(
+            replay(3, 3, set(), (1, 1), (1, 1), [(1, 1)], diagnose=True),
+            {"valid": True, "cost": 0, "steps": 0,
+             "error": None, "error_index": None},
+        )
+
+    def test_costs_still_recomputed(self):
+        costs = [[1, 10, 1], [1, 10, 1], [1, 1, 1]]
+        manual = [(0, 0), (0, 1), (0, 2), (1, 2), (2, 2), (2, 1), (2, 0)]
+        result = replay(3, 3, set(), (0, 0), (2, 0), manual, costs=costs,
+                        diagnose=True)
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["cost"],
+                         sum(costs[y][x] for x, y in manual[1:]))
+        self.assertEqual(result["steps"], 6)
+        self.assertIsNone(result["error"])
+        self.assertIsNone(result["error_index"])
+
+    def test_start_mismatch(self):
+        result = replay(3, 3, set(), (0, 0), (2, 2),
+                        [(0, 1), (1, 1), (2, 1), (2, 2)], diagnose=True)
+        self.assertEqual(result, {
+            "valid": False, "cost": None, "steps": None,
+            "error": "start_mismatch", "error_index": 0,
+        })
+
+    def test_goal_mismatch_points_at_last_element(self):
+        result = replay(3, 3, set(), (0, 0), (2, 2),
+                        [(0, 0), (1, 0), (2, 0)], diagnose=True)
+        self.assertEqual(result, {
+            "valid": False, "cost": None, "steps": None,
+            "error": "goal_mismatch", "error_index": 2,
+        })
+
+    def test_start_mismatch_takes_precedence_over_goal_mismatch(self):
+        result = replay(3, 3, set(), (0, 0), (2, 2),
+                        [(0, 1), (1, 1), (2, 1)], diagnose=True)
+        self.assertEqual(result["error"], "start_mismatch")
+        self.assertEqual(result["error_index"], 0)
+
+    def test_start_goal_extra(self):
+        result = replay(3, 3, set(), (1, 1), (1, 1),
+                        [(1, 1), (1, 2), (1, 1)], diagnose=True)
+        self.assertEqual(result, {
+            "valid": False, "cost": None, "steps": None,
+            "error": "start_goal_extra", "error_index": 1,
+        })
+
+    def test_repeated_coordinate_points_at_second_occurrence(self):
+        result = replay(3, 3, set(), (0, 0), (2, 2),
+                        [(0, 0), (1, 0), (0, 0), (0, 1), (1, 1),
+                         (2, 1), (2, 2)], diagnose=True)
+        self.assertEqual(result, {
+            "valid": False, "cost": None, "steps": None,
+            "error": "repeated_coordinate", "error_index": 2,
+        })
+
+    def test_non_adjacent_points_at_later_point(self):
+        result = replay(5, 1, set(), (0, 0), (4, 0),
+                        [(0, 0), (2, 0), (3, 0), (4, 0)], diagnose=True)
+        self.assertEqual(result, {
+            "valid": False, "cost": None, "steps": None,
+            "error": "non_adjacent", "error_index": 1,
+        })
+        diagonal = replay(3, 3, set(), (0, 0), (2, 2),
+                          [(0, 0), (1, 1), (2, 2)], diagnose=True)
+        self.assertEqual(diagonal["error"], "non_adjacent")
+        self.assertEqual(diagonal["error_index"], 1)
+
+    def test_static_blocked(self):
+        result = replay(3, 3, {(1, 0)}, (0, 0), (2, 0),
+                        [(0, 0), (1, 0), (2, 0)], diagnose=True)
+        self.assertEqual(result, {
+            "valid": False, "cost": None, "steps": None,
+            "error": "static_blocked", "error_index": 1,
+        })
+
+    def test_dynamic_blocked_at_matching_frame(self):
+        # (1, 0) is free at t=1 but blocked at t=2.
+        frames = [[], [], [(1, 0)]]
+        result = replay(3, 2, set(), (0, 0), (2, 0),
+                        [(0, 0), (0, 1), (1, 1), (1, 0), (2, 0)],
+                        dynamic_blocked=frames, diagnose=True)
+        self.assertEqual(result, {
+            "valid": False, "cost": None, "steps": None,
+            "error": "dynamic_blocked", "error_index": 3,
+        })
+
+    def test_dynamic_blocked_under_persisted_last_frame(self):
+        frames = [[], [(1, 0)]]
+        result = replay(3, 1, set(), (0, 0), (2, 0),
+                        [(0, 0), (1, 0), (2, 0)],
+                        dynamic_blocked=frames, diagnose=True)
+        self.assertEqual(result["error"], "dynamic_blocked")
+        self.assertEqual(result["error_index"], 1)
+
+    def test_rule_precedence_within_a_single_element(self):
+        # At index 1 the move is non-adjacent and the entered cell is both
+        # statically and dynamically blocked; non_adjacent wins.
+        frames = [[], [(2, 0)]]
+        result = replay(5, 1, {(2, 0)}, (0, 0), (4, 0),
+                        [(0, 0), (2, 0), (3, 0), (4, 0)],
+                        dynamic_blocked=frames, diagnose=True)
+        self.assertEqual(result["error"], "non_adjacent")
+        self.assertEqual(result["error_index"], 1)
+        # Adjacent but both statically and dynamically blocked: static wins.
+        frames = [[], [(1, 0)]]
+        result = replay(3, 1, {(1, 0)}, (0, 0), (2, 0),
+                        [(0, 0), (1, 0), (2, 0)], dynamic_blocked=frames,
+                        diagnose=True)
+        self.assertEqual(result["error"], "static_blocked")
+        self.assertEqual(result["error_index"], 1)
+
+    def test_invalid_never_raises_and_never_accumulates_cost(self):
+        result = replay(3, 3, set(), (0, 0), (2, 2),
+                        [(0, 0), (1, 1), (2, 2)],
+                        costs=[[1, 1, 1], [1, 1, 1], [1, 1, 1]],
+                        diagnose=True)
+        self.assertFalse(result["valid"])
+        self.assertIsNone(result["cost"])
+        self.assertIsNone(result["steps"])
+        self.assertNotIn(None, (result["error"],))
+        self.assertEqual(set(result),
+                         {"valid", "cost", "steps", "error", "error_index"})
+
+    def test_diagnose_type_error_after_grid_checks_before_path_checks(self):
+        # Non-bool diagnose is a TypeError.
+        for bad in (1, 0, "true", None, 1.0, [True]):
+            with self.assertRaises(TypeError, msg=f"diagnose={bad!r}"):
+                replay(3, 3, set(), (0, 0), (2, 2),
+                       [(0, 0), (2, 2)], diagnose=bad)
+        # Grid ValueError (non-positive width) is reported first.
+        with self.assertRaises(ValueError):
+            replay(0, 3, set(), (0, 0), (2, 2), "bad-path", diagnose=1)
+        # Frame-0 ValueError precedes the diagnose TypeError.
+        with self.assertRaises(ValueError):
+            replay(3, 3, set(), (0, 0), (2, 2), [(0, 0)],
+                   dynamic_blocked=[[(0, 0)]], diagnose=1)
+        # The diagnose TypeError precedes the path structure TypeError.
+        with self.assertRaises(TypeError):
+            replay(3, 3, set(), (0, 0), (2, 2), "bad-path", diagnose=1)
+        # diagnose=True still applies the existing path validation.
+        with self.assertRaises(TypeError):
+            replay(3, 3, set(), (0, 0), (2, 2), "bad-path", diagnose=True)
+        with self.assertRaises(TypeError):
+            replay(3, 3, set(), (0, 0), (2, 2), [], diagnose=True)
+        with self.assertRaises(ValueError):
+            replay(3, 3, set(), (0, 0), (2, 2), [(0, 0), (3, 3)],
+                   diagnose=True)
+
+    def test_diagnose_true_matches_plan_on_random_grids(self):
+        import random
+        rng = random.Random(424242)
+        for _ in range(30):
+            w, h = rng.randint(1, 6), rng.randint(1, 6)
+            cells = [(x, y) for y in range(h) for x in range(w)]
+            blocked = {p for p in cells[1:-1] if rng.random() < 0.2}
+            start, goal = cells[0], cells[-1]
+            if start in blocked or goal in blocked:
+                continue
+            planned = plan(w, h, blocked, start, goal)
+            if planned["path"] is None:
+                continue
+            result = replay(w, h, blocked, start, goal, planned["path"],
+                            diagnose=True)
+            self.assertTrue(result["valid"])
+            self.assertEqual(result["cost"], planned["cost"])
+            self.assertEqual(result["steps"], len(planned["path"]) - 1)
+            self.assertIsNone(result["error"])
+            self.assertIsNone(result["error_index"])
+
+
 if __name__ == '__main__':
     unittest.main()

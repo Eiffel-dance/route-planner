@@ -13,7 +13,19 @@ Tests: python3 -m unittest discover -s tests -v
 
 `plan(width, height, blocked, start, goal, costs=None, trace=False, dynamic_blocked=None)` 默认返回 `{"path", "cost", "expanded"}`；`trace=True` 时额外返回 `expanded_nodes`。
 
-`replay(width, height, blocked, start, goal, path, costs=None, dynamic_blocked=None)` 用于离线核验一条已保存的候选路径并重新计算代价；它不执行搜索，返回值不含 `expanded` 或 `expanded_nodes` 字段，且不接受 `trace` 参数。
+`replay(width, height, blocked, start, goal, path, costs=None, dynamic_blocked=None, diagnose=False)` 用于离线核验一条已保存的候选路径并重新计算代价；它不执行搜索，返回值不含 `expanded` 或 `expanded_nodes` 字段，且不接受 `trace` 参数。
+
+**诊断模式（`diagnose=True`）**
+- `diagnose` 只能是布尔值；省略或为 `False` 时，`replay` 的返回键、值、异常类型与校验顺序与默认行为完全一致。非布尔值在全部网格校验（含动态第零帧）完成后、`path` 结构检查之前抛出 `TypeError`。
+- 传 `True` 且结构合法时，有效路径仍返回 `valid`、`cost`、`steps`，并额外返回 `"error": None, "error_index": None`；`cost` 仍按进入格子规则重算，`steps == len(path) - 1`。
+- 无效路径仍不抛异常，`cost`、`steps` 为 `None`，并返回唯一的 `error` 及首个违规元素的零基 `path` 下标。按固定优先级（同一点同时满足多项时取最前者，且不返回任何部分累计代价）：
+  - `start_mismatch`：首点不是 `start`，下标 0；
+  - `goal_mismatch`：末点不是 `goal`，下标为末点（`len(path) - 1`）；
+  - `start_goal_extra`：`start == goal` 却含多余点，下标 1；
+  - `repeated_coordinate`：重复坐标，指向第二次出现的位置；
+  - `non_adjacent`：相邻点不是四邻域移动，指向后一个点；
+  - `static_blocked`：经过静态障碍，指向该点；
+  - `dynamic_blocked`：在对应时间帧（或持续使用的末帧）中被禁行，指向该点。
 
 **replay 返回结构**
 - 路径合规时返回 `{"valid": True, "cost": int, "steps": int}`：`steps` 为移动边数，恒等于 `len(path) - 1`（`start == goal` 的单点路径为 0）；`cost` 按 `plan` 既有的进入格子规则重算，即路径所进入格子的代价之和，未提供 `costs` 时每步为 1，提供时起点代价不计入，因此与 `plan` 对同一路径给出的代价一致。

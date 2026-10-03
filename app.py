@@ -2,7 +2,7 @@
 
 Public entry points: ``plan(width, height, blocked, start, goal, costs=None,
 trace=False, dynamic_blocked=None)`` and ``replay(width, height, blocked,
-start, goal, path, costs=None, dynamic_blocked=None)``.
+start, goal, path, costs=None, dynamic_blocked=None, diagnose=False)``.
 
 Semantics:
 - Four-neighborhood moves, Manhattan heuristic. Without ``costs`` each step
@@ -78,6 +78,21 @@ Offline replay (``replay``):
   same entering-cell rule ``plan`` uses (sum of the costs of the cells
   entered; unit costs without ``costs``; the start cell is never
   counted), so it equals the cost ``plan`` assigns to that same path.
+- ``diagnose`` defaults to false; omitting it or passing ``False`` keeps
+  every key, value, exception type and validation order identical. A
+  non-bool ``diagnose`` raises ``TypeError`` after all grid checks
+  (including the frame-0 check) and before the path structure is
+  inspected. With ``diagnose=True`` both results additionally carry
+  ``error`` and ``error_index``: ``None``/``None`` for a valid path, and
+  for an invalid one a single error code plus the zero-based index of
+  the first offending element, with ``cost``/``steps`` still ``None``.
+  The codes, in fixed precedence order, are ``start_mismatch`` (index
+  0), ``goal_mismatch`` (index of the last element),
+  ``start_goal_extra`` (index 1), ``repeated_coordinate`` (the second
+  occurrence), ``non_adjacent`` (the later element of the pair),
+  ``static_blocked`` and ``dynamic_blocked`` (the offending element);
+  ties resolve to the earliest rule in this list and no partial cost is
+  ever returned.
 
 Validation (all performed before the search starts):
 - ``width``/``height`` must be positive integers.
@@ -101,9 +116,6 @@ __all__ = ["plan", "replay"]
 
 # Fixed neighbor generation order: +x, -x, +y, -y.
 _NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1))
-
-# The fixed structure returned for a semantically invalid candidate.
-_INVALID_REPLAY = {"valid": False, "cost": None, "steps": None}
 
 
 def _is_int(value):
@@ -444,7 +456,7 @@ def plan(width, height, blocked, start, goal, costs=None, trace=False,
 
 
 def replay(width, height, blocked, start, goal, path, costs=None,
-           dynamic_blocked=None):
+           dynamic_blocked=None, diagnose=False):
     # --- Validation: identical to ``plan`` and fully completed before ---
     # --- the candidate path is inspected or judged in any way.        ---
     width = _validate_dimension(width, "width")
@@ -462,6 +474,10 @@ def replay(width, height, blocked, start, goal, path, costs=None,
     frames = _normalize_dynamic_blocked(dynamic_blocked, width, height)
     if frames is not None and start in frames[0]:
         raise ValueError(f"start {start} is blocked at frame 0")
+    if not isinstance(diagnose, bool):
+        raise TypeError(
+            f"diagnose must be a bool, got {type(diagnose).__name__}"
+        )
     points = _normalize_path(path, width, height)
 
     def step_cost(point):
@@ -470,15 +486,30 @@ def replay(width, height, blocked, start, goal, path, costs=None,
             return 1
         return costs[point[1]][point[0]]
 
+    def invalid(error, error_index):
+        # The fixed invalid structure, with the diagnostic fields only
+        # present when diagnostics were requested.
+        result = {"valid": False, "cost": None, "steps": None}
+        if diagnose:
+            result["error"] = error
+            result["error_index"] = error_index
+        return result
+
     # --- Semantic checks: failures return the fixed invalid structure; ---
     # --- no exception and no partial cost/steps are reported.         ---
-    if points[0] != start or points[-1] != goal:
-        return dict(_INVALID_REPLAY)
+    if points[0] != start:
+        return invalid("start_mismatch", 0)
+    if points[-1] != goal:
+        return invalid("goal_mismatch", len(points) - 1)
     if start == goal:
         # The only admissible route is the single-point route.
         if len(points) != 1:
-            return dict(_INVALID_REPLAY)
-        return {"valid": True, "cost": 0, "steps": 0}
+            return invalid("start_goal_extra", 1)
+        result = {"valid": True, "cost": 0, "steps": 0}
+        if diagnose:
+            result["error"] = None
+            result["error_index"] = None
+        return result
 
     last_frame = len(frames) - 1 if frames is not None else None
     seen = set()
@@ -486,18 +517,22 @@ def replay(width, height, blocked, start, goal, path, costs=None,
     previous = None
     for t, point in enumerate(points):
         if point in seen:
-            return dict(_INVALID_REPLAY)  # repeated coordinate
+            return invalid("repeated_coordinate", t)  # second occurrence
         if previous is not None:
             if (abs(point[0] - previous[0])
                     + abs(point[1] - previous[1])) != 1:
-                return dict(_INVALID_REPLAY)  # not a four-neighborhood move
+                return invalid("non_adjacent", t)  # later point of the pair
             total += step_cost(point)
         if point in obstacles:
-            return dict(_INVALID_REPLAY)  # static obstacle
+            return invalid("static_blocked", t)  # static obstacle
         if frames is not None:
             frame = frames[t] if t <= last_frame else frames[last_frame]
             if point in frame:
-                return dict(_INVALID_REPLAY)  # blocked at time frame t
+                return invalid("dynamic_blocked", t)  # blocked at frame t
         seen.add(point)
         previous = point
-    return {"valid": True, "cost": total, "steps": len(points) - 1}
+    result = {"valid": True, "cost": total, "steps": len(points) - 1}
+    if diagnose:
+        result["error"] = None
+        result["error_index"] = None
+    return result

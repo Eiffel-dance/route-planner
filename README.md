@@ -11,7 +11,13 @@ Tests: python3 -m unittest discover -s tests -v
 
 ## API 约定
 
-`plan(width, height, blocked, start, goal, costs=None, trace=False, dynamic_blocked=None)` 默认返回 `{"path", "cost", "expanded"}`；`trace=True` 时额外返回 `expanded_nodes`。
+`plan(width, height, blocked, start, goal, costs=None, trace=False, dynamic_blocked=None, max_expanded=None)` 默认返回 `{"path", "cost", "expanded"}`；`trace=True` 时额外返回 `expanded_nodes`；提供 `max_expanded` 时额外返回 `status`。
+
+**搜索预算（`max_expanded`）**
+- `max_expanded` 省略或为 `None` 时，返回键、值、异常类型与校验顺序与既有行为完全一致。提供时必须是非负且非布尔的整数：其他类型抛 `TypeError`，负数抛 `ValueError`；这些校验在全部既有网格、`costs`、`trace` 与 `dynamic_blocked` 校验（含第 0 帧检查）完成之后、搜索开始前进行。
+- 预算按关闭节点数计（即 `expanded` 的计数口径），达到上限后不再关闭任何节点。提供预算时结果始终额外携带 `status`：目标在限额内关闭为 `"found"`（返回既有的 `path`/`cost`）；候选耗尽仍未到达目标为 `"unreachable"`；尚有候选但预算耗尽为 `"budget_exhausted"`（`path`/`cost` 为 `None`，`expanded` 为实际关闭数，不超过 `max_expanded`）。
+- 预算对静态与动态模式同样生效，且不改变扩展顺序、路径选择、轨迹条目或确定性：带预算的轨迹是无预算轨迹的前缀。`trace=True` 时只记录实际关闭的节点，预算为零时即使 `start == goal` 也返回 `budget_exhausted`（`expanded` 为 0，`expanded_nodes` 为空）；单点成功结果要求至少关闭一个节点（`max_expanded >= 1`）。
+- `replay` 不受预算影响：不接受预算参数，仍只校验候选路径。
 
 `replay(width, height, blocked, start, goal, path, costs=None, dynamic_blocked=None, diagnose=False)` 用于离线核验一条已保存的候选路径并重新计算代价；它不执行搜索，返回值不含 `expanded` 或 `expanded_nodes` 字段，且不接受 `trace` 参数。
 

@@ -1,7 +1,7 @@
 import unittest
 
 import app
-from app import plan
+from app import plan, replay
 
 
 class PathSemanticsTest(unittest.TestCase):
@@ -401,6 +401,241 @@ class DynamicPlannerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             plan(0, 3, set(), (0, 0), (1, 1), trace=1,
                  dynamic_blocked=[[]])
+
+
+class ReplayTest(unittest.TestCase):
+    INVALID = {"valid": False, "cost": None, "steps": None}
+
+    def test_valid_planned_path_static(self):
+        blocked = {(2, 0), (2, 1), (2, 2), (0, 2), (4, 1)}
+        planned = plan(6, 4, blocked, (0, 0), (5, 3))
+        result = replay(6, 4, blocked, (0, 0), (5, 3), planned["path"])
+        self.assertEqual(result, {
+            "valid": True,
+            "cost": planned["cost"],
+            "steps": len(planned["path"]) - 1,
+        })
+        self.assertEqual(set(result), {"valid", "cost", "steps"})
+
+    def test_valid_single_point_route(self):
+        self.assertEqual(
+            replay(3, 3, set(), (1, 1), (1, 1), [(1, 1)]),
+            {"valid": True, "cost": 0, "steps": 0},
+        )
+
+    def test_cost_matches_plan_with_costs(self):
+        costs = [
+            [1, 10, 1],
+            [1, 10, 1],
+            [1, 1, 1],
+        ]
+        planned = plan(3, 3, set(), (0, 0), (2, 0), costs=costs)
+        result = replay(3, 3, set(), (0, 0), (2, 0), planned["path"],
+                        costs=costs)
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["cost"], planned["cost"])
+        self.assertEqual(result["steps"], len(planned["path"]) - 1)
+        # Any manually specified feasible route recomputes entering costs.
+        manual = [(0, 0), (0, 1), (0, 2), (1, 2), (2, 2), (2, 1), (2, 0)]
+        result = replay(3, 3, set(), (0, 0), (2, 0), manual, costs=costs)
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["cost"],
+                         sum(costs[y][x] for x, y in manual[1:]))
+        self.assertEqual(result["steps"], 6)
+
+    def test_dynamic_planned_path_is_valid(self):
+        frames = [
+            [(0, 1), (0, 2)],
+            [(0, 1), (1, 2), (2, 0), (2, 2)],
+            [(2, 1), (2, 2)],
+            [(0, 0), (1, 2), (2, 1), (2, 2)],
+            [],
+            [(0, 1)],
+        ]
+        planned = plan(3, 3, set(), (1, 0), (2, 2), dynamic_blocked=frames)
+        result = replay(3, 3, set(), (1, 0), (2, 2), planned["path"],
+                        dynamic_blocked=frames)
+        self.assertEqual(result, {
+            "valid": True,
+            "cost": planned["cost"],
+            "steps": len(planned["path"]) - 1,
+        })
+
+    def test_dynamic_frame_at_each_index(self):
+        # (1, 0) is free at t=1 but blocked at t=2; arriving there on the
+        # second move is invalid.
+        frames = [[], [], [(1, 0)]]
+        bad = [(0, 0), (0, 1), (1, 1), (1, 0), (2, 0)]
+        self.assertEqual(
+            replay(3, 2, set(), (0, 0), (2, 0), bad,
+                   dynamic_blocked=frames),
+            self.INVALID,
+        )
+        good = [(0, 0), (0, 1), (1, 1), (2, 1), (2, 0)]
+        result = replay(3, 2, set(), (0, 0), (2, 0), good,
+                        dynamic_blocked=frames)
+        self.assertEqual(result, {"valid": True, "cost": 4, "steps": 4})
+
+    def test_last_frame_persists(self):
+        # A single non-empty frame 1 blocks (1, 0) for every t >= 1.
+        frames = [[], [(1, 0)]]
+        bad = [(0, 0), (1, 0), (2, 0)]
+        self.assertEqual(
+            replay(3, 1, set(), (0, 0), (2, 0), bad,
+                   dynamic_blocked=frames),
+            self.INVALID,
+        )
+
+    def test_empty_or_omitted_dynamic_blocked_matches_static(self):
+        path = [(0, 0), (0, 1), (1, 1), (2, 1), (2, 0)]
+        for kwargs in ({}, {"dynamic_blocked": None},
+                       {"dynamic_blocked": []}, {"dynamic_blocked": ()}):
+            result = replay(3, 3, set(), (0, 0), (2, 0), path, **kwargs)
+            self.assertEqual(result, {"valid": True, "cost": 4, "steps": 4},
+                             msg=f"kwargs={kwargs}")
+
+    def test_semantically_invalid_paths(self):
+        # Does not begin at start.
+        self.assertEqual(
+            replay(3, 3, set(), (0, 0), (2, 2), [(0, 1), (1, 1), (2, 2)]),
+            self.INVALID,
+        )
+        # Does not end at goal.
+        self.assertEqual(
+            replay(3, 3, set(), (0, 0), (2, 2), [(0, 0), (1, 0), (2, 0)]),
+            self.INVALID,
+        )
+        # Visits a static obstacle.
+        self.assertEqual(
+            replay(3, 3, {(1, 0)}, (0, 0), (2, 0),
+                   [(0, 0), (1, 0), (2, 0)]),
+            self.INVALID,
+        )
+        # Diagonal (non-four-neighborhood) move.
+        self.assertEqual(
+            replay(3, 3, set(), (0, 0), (2, 2),
+                   [(0, 0), (1, 1), (2, 2)]),
+            self.INVALID,
+        )
+        # Jump farther than one cell.
+        self.assertEqual(
+            replay(5, 1, set(), (0, 0), (4, 0),
+                   [(0, 0), (2, 0), (3, 0), (4, 0)]),
+            self.INVALID,
+        )
+        # Repeated coordinate.
+        self.assertEqual(
+            replay(3, 3, set(), (0, 0), (2, 2),
+                   [(0, 0), (1, 0), (0, 0), (0, 1), (1, 1), (2, 1),
+                    (2, 2)]),
+            self.INVALID,
+        )
+        # start == goal with extra points.
+        self.assertEqual(
+            replay(3, 3, set(), (1, 1), (1, 1),
+                   [(1, 1), (1, 2), (1, 1)]),
+            self.INVALID,
+        )
+        # Frame 0 on the start cell is a ValueError from the shared grid
+        # checks, not an invalid result -- covered in validation tests.
+
+    def test_invalid_returns_fixed_structure_without_partial_values(self):
+        result = replay(3, 3, set(), (0, 0), (2, 2),
+                        [(0, 0), (1, 1), (2, 2)])
+        self.assertIsNone(result["cost"])
+        self.assertIsNone(result["steps"])
+        self.assertEqual(set(result), {"valid", "cost", "steps"})
+
+    def test_replay_does_not_search(self):
+        # A valid route that plan cannot even reach through search in a
+        # sealed region can still be replayed (replay never expands nodes);
+        # here a manually valid path on an open grid simply verifies the
+        # result carries no search statistics.
+        result = replay(3, 3, set(), (0, 0), (2, 2),
+                        [(0, 0), (0, 1), (0, 2), (1, 2), (2, 2)])
+        self.assertNotIn("expanded", result)
+        self.assertNotIn("expanded_nodes", result)
+        self.assertNotIn("path", result)
+
+    def test_path_type_errors(self):
+        for bad in (None, 42, "ab", b"ab", 1.5, {"x": 1}, {1, 2}):
+            with self.assertRaises(TypeError, msg=f"path={bad!r}"):
+                replay(3, 3, set(), (0, 0), (2, 2), bad)
+        # Empty sequence is a TypeError, not an invalid result.
+        for bad in ((), [], tuple()):
+            with self.assertRaises(TypeError, msg=f"path={bad!r}"):
+                replay(3, 3, set(), (0, 0), (2, 2), bad)
+        # Elements must be exactly two non-bool integers.
+        for bad in (1, "ab", (1,), (1, 2, 3), (1.5, 2), (1, None),
+                    (True, 0), None, {"x": 1, "y": 2}):
+            with self.assertRaises(TypeError, msg=f"element={bad!r}"):
+                replay(3, 3, set(), (0, 0), (2, 2), [(0, 0), bad])
+
+    def test_path_value_errors(self):
+        for bad in ((-1, 0), (0, -1), (3, 0), (0, 3), (10, 10)):
+            with self.assertRaises(ValueError, msg=f"element={bad!r}"):
+                replay(3, 3, set(), (0, 0), (2, 2), [(0, 0), bad])
+
+    def test_grid_validation_precedes_path_judgement(self):
+        # Malformed grid inputs raise the same errors as plan regardless of
+        # the candidate path, even when the path itself is also bad.
+        bad_path = "not-a-path"
+        with self.assertRaises(TypeError):
+            replay("3", 3, set(), (0, 0), (1, 1), bad_path)
+        with self.assertRaises(ValueError):
+            replay(0, 3, set(), (0, 0), (1, 1), bad_path)
+        with self.assertRaises(TypeError):
+            replay(3, 3, 42, (0, 0), (1, 1), bad_path)
+        with self.assertRaises(ValueError):
+            replay(3, 3, {(0, 0)}, (0, 0), (2, 2), bad_path)
+        with self.assertRaises(ValueError):
+            replay(3, 3, set(), (-1, 0), (2, 2), bad_path)
+        with self.assertRaises(TypeError):
+            replay(3, 3, set(), (0, 0), "nope", bad_path)
+        with self.assertRaises(ValueError):
+            replay(3, 3, set(), (0, 0), (2, 2), bad_path,
+                    costs=[[1, 1], [1, 1], [1, 1]])
+        with self.assertRaises(ValueError):
+            replay(3, 3, set(), (0, 0), (1, 1), bad_path,
+                    dynamic_blocked=[[(0, 0)]])
+        with self.assertRaises(TypeError):
+            replay(3, 3, set(), (0, 0), (1, 1), bad_path,
+                    dynamic_blocked=42)
+
+    def test_start_blocked_at_frame_zero_still_raises(self):
+        with self.assertRaises(ValueError):
+            replay(3, 3, set(), (0, 0), (2, 2), [(0, 0)],
+                   dynamic_blocked=[[(0, 0)]])
+
+    def test_lists_normalized_to_tuples_for_comparison(self):
+        result = replay(3, 3, [[1, 0]], [0, 0], [2, 2],
+                        [[0, 0], [0, 1], [1, 1], [2, 1], [2, 2]])
+        self.assertEqual(result, {"valid": True, "cost": 4, "steps": 4})
+
+    def test_replay_matches_plan_costs_across_random_grids(self):
+        import random
+        rng = random.Random(20261004)
+        for _ in range(40):
+            w, h = rng.randint(1, 6), rng.randint(1, 6)
+            cells = [(x, y) for y in range(h) for x in range(w)]
+            blocked = {p for p in cells[1:-1] if rng.random() < 0.2}
+            start, goal = cells[0], cells[-1]
+            if start in blocked or goal in blocked:
+                continue
+            if rng.random() < 0.5:
+                costs = [[rng.randint(1, 9) for _ in range(w)]
+                         for _ in range(h)]
+                kwargs = {"costs": costs}
+            else:
+                kwargs = {}
+            planned = plan(w, h, blocked, start, goal, **kwargs)
+            if planned["path"] is None:
+                continue
+            result = replay(w, h, blocked, start, goal, planned["path"],
+                            **kwargs)
+            self.assertTrue(result["valid"])
+            self.assertEqual(result["cost"], planned["cost"])
+            self.assertEqual(result["steps"], len(planned["path"]) - 1)
 
 
 if __name__ == '__main__':

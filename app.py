@@ -1,7 +1,8 @@
 """Deterministic 2D grid A* planner.
 
-Public entry point: ``plan(width, height, blocked, start, goal, costs=None,
-trace=False, dynamic_blocked=None)``.
+Public entry points: ``plan(width, height, blocked, start, goal, costs=None,
+trace=False, dynamic_blocked=None)`` and ``replay(width, height, blocked,
+start, goal, path, costs=None, dynamic_blocked=None)``.
 
 Semantics:
 - Four-neighborhood moves, Manhattan heuristic. Without ``costs`` each step
@@ -53,6 +54,31 @@ Dynamic obstacles (``dynamic_blocked``):
   duplicates within a frame are merged, and a ``start`` blocked at frame 0
   raises ``ValueError``. All checks run before the search starts.
 
+Offline replay (``replay``):
+- ``replay`` re-checks a saved candidate path without running any search;
+  it never returns ``expanded`` or ``expanded_nodes``. It accepts the same
+  grid arguments as ``plan`` (no ``trace``) plus ``path``.
+- The grid arguments are validated with exactly the public ``plan``
+  checks, and all of them run before the path is judged, so the same
+  malformed grid inputs raise the same ``TypeError``/``ValueError``.
+- ``path`` must be a non-empty sequence of grid coordinates; strings,
+  bytes, ``None`` and other non-sequences raise ``TypeError``, as do
+  elements that are not exactly two integers. Coordinates outside the
+  grid raise ``ValueError``.
+- A structurally valid but semantically invalid path does not raise: it
+  returns ``{"valid": False, "cost": None, "steps": None}`` with no
+  partial accumulation. Invalid means: not beginning at ``start``, not
+  ending at ``goal``, visiting a static obstacle, visiting a cell blocked
+  by frame ``t`` at path index ``t`` (the last frame persists for later
+  indices; omitted/empty ``dynamic_blocked`` means static-only checks),
+  non-four-neighbor adjacency, repeated coordinates, or extra points when
+  ``start == goal``.
+- A valid path returns ``{"valid": True, "cost": int, "steps": int}``
+  where ``steps == len(path) - 1`` and ``cost`` is recomputed with the
+  same entering-cell rule ``plan`` uses (sum of the costs of the cells
+  entered; unit costs without ``costs``; the start cell is never
+  counted), so it equals the cost ``plan`` assigns to that same path.
+
 Validation (all performed before the search starts):
 - ``width``/``height`` must be positive integers.
 - ``start``, ``goal`` and every entry of ``blocked`` must be grid
@@ -71,10 +97,13 @@ Validation (all performed before the search starts):
 import heapq
 from collections.abc import Iterable, Sequence
 
-__all__ = ["plan"]
+__all__ = ["plan", "replay"]
 
 # Fixed neighbor generation order: +x, -x, +y, -y.
 _NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1))
+
+# The fixed structure returned for a semantically invalid candidate.
+_INVALID_REPLAY = {"valid": False, "cost": None, "steps": None}
 
 
 def _is_int(value):
@@ -198,6 +227,24 @@ def _normalize_dynamic_blocked(dynamic_blocked, width, height):
             cells.add(point)  # duplicates merge into one cell
         frames.append(frozenset(cells))
     return frames
+
+
+def _normalize_path(path, width, height):
+    if (path is None or isinstance(path, (str, bytes))
+            or not isinstance(path, Sequence)):
+        raise TypeError(
+            f"path must be a non-empty sequence of grid coordinates, "
+            f"got {type(path).__name__}"
+        )
+    if len(path) == 0:
+        raise TypeError("path must be a non-empty sequence of coordinates")
+    points = []
+    for index, item in enumerate(path):
+        name = f"path[{index}]"
+        point = _normalize_point(item, name)
+        _check_bounds(point, width, height, name)
+        points.append(point)
+    return points
 
 
 def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
@@ -394,3 +441,63 @@ def plan(width, height, blocked, start, goal, costs=None, trace=False,
     if trace:
         result["expanded_nodes"] = expanded_nodes
     return result
+
+
+def replay(width, height, blocked, start, goal, path, costs=None,
+           dynamic_blocked=None):
+    # --- Validation: identical to ``plan`` and fully completed before ---
+    # --- the candidate path is inspected or judged in any way.        ---
+    width = _validate_dimension(width, "width")
+    height = _validate_dimension(height, "height")
+    start = _normalize_point(start, "start")
+    goal = _normalize_point(goal, "goal")
+    _check_bounds(start, width, height, "start")
+    _check_bounds(goal, width, height, "goal")
+    obstacles = _normalize_blocked(blocked, width, height)
+    if start in obstacles:
+        raise ValueError(f"start {start} lies on a blocked cell")
+    if goal in obstacles:
+        raise ValueError(f"goal {goal} lies on a blocked cell")
+    costs = _normalize_costs(costs, width, height)
+    frames = _normalize_dynamic_blocked(dynamic_blocked, width, height)
+    if frames is not None and start in frames[0]:
+        raise ValueError(f"start {start} is blocked at frame 0")
+    points = _normalize_path(path, width, height)
+
+    def step_cost(point):
+        # Cost of entering ``point``; the start cell is never entered.
+        if costs is None:
+            return 1
+        return costs[point[1]][point[0]]
+
+    # --- Semantic checks: failures return the fixed invalid structure; ---
+    # --- no exception and no partial cost/steps are reported.         ---
+    if points[0] != start or points[-1] != goal:
+        return dict(_INVALID_REPLAY)
+    if start == goal:
+        # The only admissible route is the single-point route.
+        if len(points) != 1:
+            return dict(_INVALID_REPLAY)
+        return {"valid": True, "cost": 0, "steps": 0}
+
+    last_frame = len(frames) - 1 if frames is not None else None
+    seen = set()
+    total = 0
+    previous = None
+    for t, point in enumerate(points):
+        if point in seen:
+            return dict(_INVALID_REPLAY)  # repeated coordinate
+        if previous is not None:
+            if (abs(point[0] - previous[0])
+                    + abs(point[1] - previous[1])) != 1:
+                return dict(_INVALID_REPLAY)  # not a four-neighborhood move
+            total += step_cost(point)
+        if point in obstacles:
+            return dict(_INVALID_REPLAY)  # static obstacle
+        if frames is not None:
+            frame = frames[t] if t <= last_frame else frames[last_frame]
+            if point in frame:
+                return dict(_INVALID_REPLAY)  # blocked at time frame t
+        seen.add(point)
+        previous = point
+    return {"valid": True, "cost": total, "steps": len(points) - 1}

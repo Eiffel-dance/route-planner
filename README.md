@@ -13,7 +13,19 @@ Tests: python3 -m unittest discover -s tests -v
 
 `plan(width, height, blocked, start, goal, costs=None, trace=False, dynamic_blocked=None)` 默认返回 `{"path", "cost", "expanded"}`；`trace=True` 时额外返回 `expanded_nodes`。
 
-**输入校验（搜索开始前完成）**
+`replay(width, height, blocked, start, goal, path, costs=None, dynamic_blocked=None)` 用于离线核验一条已保存的候选路径并重新计算代价；它不执行搜索，返回值不含 `expanded` 或 `expanded_nodes` 字段，且不接受 `trace` 参数。
+
+**replay 返回结构**
+- 路径合规时返回 `{"valid": True, "cost": int, "steps": int}`：`steps` 为移动边数，恒等于 `len(path) - 1`（`start == goal` 的单点路径为 0）；`cost` 按 `plan` 既有的进入格子规则重算，即路径所进入格子的代价之和，未提供 `costs` 时每步为 1，提供时起点代价不计入，因此与 `plan` 对同一路径给出的代价一致。
+- 路径语义不合规时不抛异常，固定返回 `{"valid": False, "cost": None, "steps": None}`，不返回任何部分累计值。不合规情形包括：未从 `start` 开始、未在 `goal` 结束、经过静态障碍、经过路径下标 `t` 对应的动态障碍帧、相邻点不是四邻域移动、出现重复坐标，以及 `start == goal` 却包含多余点。
+- 合规判定与动态时间索引：`dynamic_blocked` 省略、为 `None` 或为空序列时按静态模式检查；否则路径下标 `t` 处的坐标必须避开第 `t` 帧，超过最后一帧后持续使用最后一帧（与 `plan` 的索引规则一致）。
+
+**replay 异常边界（校验先于路径判定）**
+- 网格参数（`width`、`height`、`blocked`、`start`、`goal`、`costs`、`dynamic_blocked`）沿用 `plan` 的公开校验与既有 `TypeError`/`ValueError` 边界及顺序，包括 `start` 落在静态障碍或第 0 帧时抛出 `ValueError`；这些校验全部在检查 `path` 之前完成。
+- `path` 必须是非空坐标序列：字符串、字节串、`None` 或其他非序列抛出 `TypeError`；空序列抛出 `TypeError`；元素不是恰好两个整数（含长度不为二、非整数、布尔坐标）抛出 `TypeError`；坐标越界抛出 `ValueError`。
+- 仅语义上无效（结构合法但不满足上述合规条件）的路径不抛异常，返回固定的无效结构。
+
+**plan 输入校验（搜索开始前完成）** —— replay 的网格参数沿用同一套校验：
 - `width`、`height` 必须为正整数。
 - `start`、`goal` 及 `blocked` 中每个元素必须是两个整数构成的坐标（元组或长度为二的列表等序列，统一规范化为元组）。
 - `costs` 可省略或为 `None`（单位代价）；否则必须是 `height` 行、`width` 列的正整数矩阵（按行排列，`costs[y][x]` 为进入格子 `(x, y)` 的代价）。字符串/字节串、非整数单元格、布尔值抛出 `TypeError`；行数或列数不符、代价非正抛出 `ValueError`。

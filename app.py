@@ -2,7 +2,7 @@
 
 Public entry points: ``plan(width, height, blocked, start, goal, costs=None,
 trace=False, dynamic_blocked=None)`` and ``replay(width, height, blocked,
-start, goal, path, costs=None, dynamic_blocked=None)``.
+start, goal, path, costs=None, dynamic_blocked=None, diagnose=False)``.
 
 Semantics:
 - Four-neighborhood moves, Manhattan heuristic. Without ``costs`` each step
@@ -78,6 +78,25 @@ Offline replay (``replay``):
   same entering-cell rule ``plan`` uses (sum of the costs of the cells
   entered; unit costs without ``costs``; the start cell is never
   counted), so it equals the cost ``plan`` assigns to that same path.
+- ``diagnose`` must be a bool; non-bool values raise ``TypeError`` once
+  all grid and path-structure validation above has completed. When
+  omitted or false, behavior, returned keys and validation order are
+  exactly the default behavior described above. When true, results carry
+  two extra keys, ``error`` and ``error_index``: a valid path returns
+  both as ``None``, while an invalid path still does not raise and keeps
+  ``cost``/``steps`` as ``None``, returning the single first violation
+  found in the fixed order below with the zero-based index of the path
+  element at fault:
+  ``start_mismatch`` at index 0 (first point is not ``start``);
+  ``goal_mismatch`` at the index of the last point (not ``goal``);
+  ``start_goal_extra`` at index 1 (``start == goal`` with extra points);
+  ``repeated_coordinate`` at the index of the second occurrence;
+  ``non_adjacent`` at the index of the later point of the bad move;
+  ``static_blocked`` at the offending point;
+  ``dynamic_blocked`` at the point blocked by its frame (the last frame
+  persisting beyond its own index). When several rules apply at one
+  point, the first in this order is the unique reported result; no
+  partial cost is ever reported.
 
 Validation (all performed before the search starts):
 - ``width``/``height`` must be positive integers.
@@ -104,6 +123,15 @@ _NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1))
 
 # The fixed structure returned for a semantically invalid candidate.
 _INVALID_REPLAY = {"valid": False, "cost": None, "steps": None}
+
+
+class _ReplayViolation(Exception):
+    """Internal control flow: the first semantic violation in a path."""
+
+    def __init__(self, error, error_index):
+        super().__init__(error, error_index)
+        self.error = error
+        self.error_index = error_index
 
 
 def _is_int(value):
@@ -443,8 +471,51 @@ def plan(width, height, blocked, start, goal, costs=None, trace=False,
     return result
 
 
+def _judge_replay_path(points, start, goal, obstacles, frames, step_cost):
+    """Run the semantic checks in the fixed public order.
+
+    Returns the recomputed total cost of a valid path, or raises
+    ``_ReplayViolation`` carrying the single first violation's code and
+    zero-based path index: endpoint checks first (``start_mismatch`` then
+    ``goal_mismatch``), then ``start_goal_extra``, and per index
+    ``repeated_coordinate``, ``non_adjacent``, ``static_blocked`` and
+    ``dynamic_blocked``.
+    """
+    if points[0] != start:
+        raise _ReplayViolation("start_mismatch", 0)
+    if points[-1] != goal:
+        raise _ReplayViolation("goal_mismatch", len(points) - 1)
+    if start == goal:
+        # The only admissible route is the single-point route.
+        if len(points) != 1:
+            raise _ReplayViolation("start_goal_extra", 1)
+        return 0
+
+    last_frame = len(frames) - 1 if frames is not None else None
+    seen = set()
+    total = 0
+    previous = None
+    for t, point in enumerate(points):
+        if point in seen:
+            raise _ReplayViolation("repeated_coordinate", t)
+        if previous is not None:
+            if (abs(point[0] - previous[0])
+                    + abs(point[1] - previous[1])) != 1:
+                raise _ReplayViolation("non_adjacent", t)
+            total += step_cost(point)
+        if point in obstacles:
+            raise _ReplayViolation("static_blocked", t)
+        if frames is not None:
+            frame = frames[t] if t <= last_frame else frames[last_frame]
+            if point in frame:
+                raise _ReplayViolation("dynamic_blocked", t)
+        seen.add(point)
+        previous = point
+    return total
+
+
 def replay(width, height, blocked, start, goal, path, costs=None,
-           dynamic_blocked=None):
+           dynamic_blocked=None, diagnose=False):
     # --- Validation: identical to ``plan`` and fully completed before ---
     # --- the candidate path is inspected or judged in any way.        ---
     width = _validate_dimension(width, "width")
@@ -463,6 +534,12 @@ def replay(width, height, blocked, start, goal, path, costs=None,
     if frames is not None and start in frames[0]:
         raise ValueError(f"start {start} is blocked at frame 0")
     points = _normalize_path(path, width, height)
+    # ``diagnose`` is checked only after every grid and path-structure
+    # check above, so malformed inputs raise their existing errors first.
+    if not isinstance(diagnose, bool):
+        raise TypeError(
+            f"diagnose must be a bool, got {type(diagnose).__name__}"
+        )
 
     def step_cost(point):
         # Cost of entering ``point``; the start cell is never entered.
@@ -470,34 +547,25 @@ def replay(width, height, blocked, start, goal, path, costs=None,
             return 1
         return costs[point[1]][point[0]]
 
-    # --- Semantic checks: failures return the fixed invalid structure; ---
-    # --- no exception and no partial cost/steps are reported.         ---
-    if points[0] != start or points[-1] != goal:
-        return dict(_INVALID_REPLAY)
-    if start == goal:
-        # The only admissible route is the single-point route.
-        if len(points) != 1:
+    # --- Semantic checks: failures never raise and report no partial ---
+    # --- cost/steps. In default mode they return the fixed invalid  ---
+    # --- structure; in diagnose mode the first violation code/index. ---
+    try:
+        total = _judge_replay_path(
+            points, start, goal, obstacles, frames, step_cost
+        )
+    except _ReplayViolation as violation:
+        if not diagnose:
             return dict(_INVALID_REPLAY)
-        return {"valid": True, "cost": 0, "steps": 0}
-
-    last_frame = len(frames) - 1 if frames is not None else None
-    seen = set()
-    total = 0
-    previous = None
-    for t, point in enumerate(points):
-        if point in seen:
-            return dict(_INVALID_REPLAY)  # repeated coordinate
-        if previous is not None:
-            if (abs(point[0] - previous[0])
-                    + abs(point[1] - previous[1])) != 1:
-                return dict(_INVALID_REPLAY)  # not a four-neighborhood move
-            total += step_cost(point)
-        if point in obstacles:
-            return dict(_INVALID_REPLAY)  # static obstacle
-        if frames is not None:
-            frame = frames[t] if t <= last_frame else frames[last_frame]
-            if point in frame:
-                return dict(_INVALID_REPLAY)  # blocked at time frame t
-        seen.add(point)
-        previous = point
-    return {"valid": True, "cost": total, "steps": len(points) - 1}
+        return {
+            "valid": False,
+            "cost": None,
+            "steps": None,
+            "error": violation.error,
+            "error_index": violation.error_index,
+        }
+    result = {"valid": True, "cost": total, "steps": len(points) - 1}
+    if diagnose:
+        result["error"] = None
+        result["error_index"] = None
+    return result

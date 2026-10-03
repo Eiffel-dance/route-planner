@@ -13,12 +13,25 @@ Tests: python3 -m unittest discover -s tests -v
 
 `plan(width, height, blocked, start, goal, costs=None, trace=False, dynamic_blocked=None)` 默认返回 `{"path", "cost", "expanded"}`；`trace=True` 时额外返回 `expanded_nodes`。
 
-`replay(width, height, blocked, start, goal, path, costs=None, dynamic_blocked=None)` 用于离线核验一条已保存的候选路径并重新计算代价；它不执行搜索，返回值不含 `expanded` 或 `expanded_nodes` 字段，且不接受 `trace` 参数。
+`replay(width, height, blocked, start, goal, path, costs=None, dynamic_blocked=None, diagnose=False)` 用于离线核验一条已保存的候选路径并重新计算代价；它不执行搜索，返回值不含 `expanded` 或 `expanded_nodes` 字段，且不接受 `trace` 参数。`diagnose` 省略或为 `False`（默认）时行为与下述默认约定完全一致。
 
 **replay 返回结构**
 - 路径合规时返回 `{"valid": True, "cost": int, "steps": int}`：`steps` 为移动边数，恒等于 `len(path) - 1`（`start == goal` 的单点路径为 0）；`cost` 按 `plan` 既有的进入格子规则重算，即路径所进入格子的代价之和，未提供 `costs` 时每步为 1，提供时起点代价不计入，因此与 `plan` 对同一路径给出的代价一致。
 - 路径语义不合规时不抛异常，固定返回 `{"valid": False, "cost": None, "steps": None}`，不返回任何部分累计值。不合规情形包括：未从 `start` 开始、未在 `goal` 结束、经过静态障碍、经过路径下标 `t` 对应的动态障碍帧、相邻点不是四邻域移动、出现重复坐标，以及 `start == goal` 却包含多余点。
 - 合规判定与动态时间索引：`dynamic_blocked` 省略、为 `None` 或为空序列时按静态模式检查；否则路径下标 `t` 处的坐标必须避开第 `t` 帧，超过最后一帧后持续使用最后一帧（与 `plan` 的索引规则一致）。
+
+**diagnose 诊断模式（`diagnose=True`）**
+- `diagnose` 必须是布尔值，否则在全部网格与 `path` 结构校验完成之后抛出 `TypeError`；网格、坐标范围、端点障碍、动态第零帧以及 `path` 结构校验仍先于该类型判断与一切路径语义判断。
+- 结构合法时，有效路径返回 `{"valid": True, "cost": int, "steps": int, "error": None, "error_index": None}`：`cost`、`steps` 的重算规则与默认模式完全一致。
+- 无效路径仍不抛异常，且 `cost`、`steps` 为 `None`，额外返回唯一的 `error` 与首个违规元素的零基 `path` 下标 `error_index`，不返回任何部分累计代价。按既有判定顺序：
+  - 首点不是 `start`：`start_mismatch`，下标 0；
+  - 末点不是 `goal`：`goal_mismatch`，下标为末点下标；
+  - `start == goal` 却含多余点：`start_goal_extra`，下标 1；
+  - 重复坐标：`repeated_coordinate`，指向第二次出现的位置；
+  - 相邻点不是四邻域：`non_adjacent`，指向后一个点；
+  - 经过静态障碍：`static_blocked`，指向该点；
+  - 在对应时间帧（末帧之后持续使用末帧）被禁行：`dynamic_blocked`，指向该点。
+- 同一点同时满足多项时，按上述先后确定唯一结果；`diagnose=False` 或省略时返回键、值、异常类型与校验顺序与默认行为完全一致（不含 `error`/`error_index`）。
 
 **replay 异常边界（校验先于路径判定）**
 - 网格参数（`width`、`height`、`blocked`、`start`、`goal`、`costs`、`dynamic_blocked`）沿用 `plan` 的公开校验与既有 `TypeError`/`ValueError` 边界及顺序，包括 `start` 落在静态障碍或第 0 帧时抛出 `ValueError`；这些校验全部在检查 `path` 之前完成。

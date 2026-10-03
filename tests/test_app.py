@@ -638,5 +638,267 @@ class ReplayTest(unittest.TestCase):
             self.assertEqual(result["steps"], len(planned["path"]) - 1)
 
 
+class ReplayDiagnoseTest(unittest.TestCase):
+    KEYS = {"valid", "cost", "steps", "error", "error_index"}
+
+    def _diag(self, *args, **kwargs):
+        return replay(*args, diagnose=True, **kwargs)
+
+    def test_diagnose_omitted_or_false_is_identical_to_default(self):
+        path = [(0, 0), (1, 1), (2, 2)]  # diagonal: semantically invalid
+        omitted = replay(3, 3, set(), (0, 0), (2, 2), path)
+        explicit = replay(3, 3, set(), (0, 0), (2, 2), path, diagnose=False)
+        self.assertEqual(omitted, {"valid": False, "cost": None,
+                                   "steps": None})
+        self.assertEqual(explicit, omitted)
+        self.assertEqual(set(omitted), {"valid", "cost", "steps"})
+        good = [(0, 0), (0, 1), (0, 2), (1, 2), (2, 2)]
+        good_omitted = replay(3, 3, set(), (0, 0), (2, 2), good)
+        good_explicit = replay(3, 3, set(), (0, 0), (2, 2), good,
+                               diagnose=False)
+        self.assertEqual(good_omitted,
+                         {"valid": True, "cost": 4, "steps": 4})
+        self.assertEqual(good_explicit, good_omitted)
+        self.assertEqual(set(good_omitted), {"valid", "cost", "steps"})
+
+    def test_diagnose_valid_path(self):
+        blocked = {(2, 0), (2, 1), (2, 2)}
+        planned = plan(6, 4, blocked, (0, 0), (5, 3))
+        result = self._diag(6, 4, blocked, (0, 0), (5, 3),
+                            planned["path"])
+        self.assertEqual(result, {
+            "valid": True,
+            "cost": planned["cost"],
+            "steps": len(planned["path"]) - 1,
+            "error": None,
+            "error_index": None,
+        })
+        self.assertEqual(set(result), self.KEYS)
+
+    def test_diagnose_valid_single_point_route(self):
+        self.assertEqual(
+            self._diag(3, 3, set(), (1, 1), (1, 1), [(1, 1)]),
+            {"valid": True, "cost": 0, "steps": 0,
+             "error": None, "error_index": None},
+        )
+
+    def test_diagnose_valid_with_costs(self):
+        costs = [
+            [1, 10, 1],
+            [1, 10, 1],
+            [1, 1, 1],
+        ]
+        manual = [(0, 0), (0, 1), (0, 2), (1, 2), (2, 2), (2, 1), (2, 0)]
+        result = self._diag(3, 3, set(), (0, 0), (2, 0), manual,
+                            costs=costs)
+        self.assertEqual(result, {
+            "valid": True,
+            "cost": sum(costs[y][x] for x, y in manual[1:]),
+            "steps": 6,
+            "error": None,
+            "error_index": None,
+        })
+
+    def test_start_mismatch(self):
+        result = self._diag(3, 3, set(), (0, 0), (2, 2),
+                            [(0, 1), (1, 1), (2, 2)])
+        self.assertEqual(result, {
+            "valid": False, "cost": None, "steps": None,
+            "error": "start_mismatch", "error_index": 0,
+        })
+
+    def test_goal_mismatch(self):
+        result = self._diag(3, 3, set(), (0, 0), (2, 2),
+                            [(0, 0), (1, 0), (2, 0)])
+        self.assertEqual(result, {
+            "valid": False, "cost": None, "steps": None,
+            "error": "goal_mismatch", "error_index": 2,
+        })
+
+    def test_start_goal_extra(self):
+        result = self._diag(3, 3, set(), (1, 1), (1, 1),
+                            [(1, 1), (1, 2), (1, 1)])
+        self.assertEqual(result, {
+            "valid": False, "cost": None, "steps": None,
+            "error": "start_goal_extra", "error_index": 1,
+        })
+
+    def test_repeated_coordinate(self):
+        result = self._diag(3, 3, set(), (0, 0), (2, 2),
+                            [(0, 0), (1, 0), (0, 0), (0, 1), (1, 1),
+                             (2, 1), (2, 2)])
+        self.assertEqual(result, {
+            "valid": False, "cost": None, "steps": None,
+            "error": "repeated_coordinate", "error_index": 2,
+        })
+
+    def test_non_adjacent_diagonal_and_jump(self):
+        result = self._diag(3, 3, set(), (0, 0), (2, 2),
+                            [(0, 0), (1, 1), (2, 2)])
+        self.assertEqual(result["error"], "non_adjacent")
+        self.assertEqual(result["error_index"], 1)
+        result = self._diag(5, 1, set(), (0, 0), (4, 0),
+                            [(0, 0), (2, 0), (3, 0), (4, 0)])
+        self.assertEqual(result, {
+            "valid": False, "cost": None, "steps": None,
+            "error": "non_adjacent", "error_index": 1,
+        })
+
+    def test_static_blocked(self):
+        result = self._diag(3, 3, {(1, 0)}, (0, 0), (2, 0),
+                            [(0, 0), (1, 0), (2, 0)])
+        self.assertEqual(result, {
+            "valid": False, "cost": None, "steps": None,
+            "error": "static_blocked", "error_index": 1,
+        })
+
+    def test_dynamic_blocked_at_frame(self):
+        # (1, 0) is free at t=1 but blocked at t=2.
+        frames = [[], [], [(1, 0)]]
+        bad = [(0, 0), (0, 1), (1, 1), (1, 0), (2, 0)]
+        result = self._diag(3, 2, set(), (0, 0), (2, 0), bad,
+                            dynamic_blocked=frames)
+        self.assertEqual(result, {
+            "valid": False, "cost": None, "steps": None,
+            "error": "dynamic_blocked", "error_index": 3,
+        })
+        good = [(0, 0), (0, 1), (1, 1), (2, 1), (2, 0)]
+        self.assertEqual(
+            self._diag(3, 2, set(), (0, 0), (2, 0), good,
+                       dynamic_blocked=frames),
+            {"valid": True, "cost": 4, "steps": 4,
+             "error": None, "error_index": None},
+        )
+
+    def test_dynamic_blocked_uses_persisting_last_frame(self):
+        # Frame 1 blocks (1, 0) for every t >= 1.
+        frames = [[], [(1, 0)]]
+        result = self._diag(3, 1, set(), (0, 0), (2, 0),
+                            [(0, 0), (1, 0), (2, 0)],
+                            dynamic_blocked=frames)
+        self.assertEqual(result, {
+            "valid": False, "cost": None, "steps": None,
+            "error": "dynamic_blocked", "error_index": 1,
+        })
+
+    def test_diagnose_matches_plan_on_dynamic_routes(self):
+        frames = [
+            [(0, 1), (0, 2)],
+            [(0, 1), (1, 2), (2, 0), (2, 2)],
+            [(2, 1), (2, 2)],
+            [(0, 0), (1, 2), (2, 1), (2, 2)],
+            [],
+            [(0, 1)],
+        ]
+        planned = plan(3, 3, set(), (1, 0), (2, 2),
+                       dynamic_blocked=frames)
+        result = self._diag(3, 3, set(), (1, 0), (2, 2),
+                            planned["path"], dynamic_blocked=frames)
+        self.assertEqual(result, {
+            "valid": True,
+            "cost": planned["cost"],
+            "steps": len(planned["path"]) - 1,
+            "error": None,
+            "error_index": None,
+        })
+
+    def test_endpoint_checks_take_priority_over_other_violations(self):
+        # First point is not start even though the last point is not goal
+        # either: start_mismatch wins.
+        result = self._diag(3, 3, set(), (0, 0), (2, 2),
+                            [(0, 1), (1, 1), (2, 1)])
+        self.assertEqual(result["error"], "start_mismatch")
+        self.assertEqual(result["error_index"], 0)
+        # start == goal but the first point is wrong: start_mismatch
+        # precedes start_goal_extra.
+        result = self._diag(3, 3, set(), (1, 1), (1, 1),
+                            [(0, 0), (1, 1)])
+        self.assertEqual(result, {
+            "valid": False, "cost": None, "steps": None,
+            "error": "start_mismatch", "error_index": 0,
+        })
+        # First point matches start but the last does not: goal_mismatch
+        # precedes start_goal_extra.
+        result = self._diag(3, 3, set(), (1, 1), (1, 1),
+                            [(1, 1), (0, 0)])
+        self.assertEqual(result["error"], "goal_mismatch")
+        self.assertEqual(result["error_index"], 1)
+
+    def test_repeated_coordinate_precedes_non_adjacent(self):
+        # At index 3 the cell (0, 0) is both a revisit and two cells away
+        # from the previous point (2, 0); endpoints still match.
+        result = self._diag(3, 1, set(), (0, 0), (2, 0),
+                            [(0, 0), (1, 0), (2, 0), (0, 0),
+                             (1, 0), (2, 0)])
+        self.assertEqual(result["error"], "repeated_coordinate")
+        self.assertEqual(result["error_index"], 3)
+
+    def test_non_adjacent_precedes_static_blocked(self):
+        # (2, 0) is both non-adjacent to (0, 0) and a static obstacle;
+        # the goal lies beyond it and stays passable.
+        result = self._diag(5, 1, {(2, 0)}, (0, 0), (4, 0),
+                            [(0, 0), (2, 0), (3, 0), (4, 0)])
+        self.assertEqual(result["error"], "non_adjacent")
+        self.assertEqual(result["error_index"], 1)
+
+    def test_static_blocked_precedes_dynamic_blocked(self):
+        # Index 1 is both a static obstacle and blocked by frame 1.
+        result = self._diag(
+            3, 1, {(1, 0)}, (0, 0), (2, 0),
+            [(0, 0), (1, 0), (2, 0)],
+            dynamic_blocked=[[], [(1, 0)]],
+        )
+        self.assertEqual(result["error"], "static_blocked")
+        self.assertEqual(result["error_index"], 1)
+
+    def test_never_reports_partial_cost_or_steps(self):
+        # Three valid unit moves precede the violation at index 4; even so
+        # neither the accumulated cost (4) nor steps leak into the result.
+        bad = [(0, 0), (0, 1), (1, 1), (2, 1), (2, 0)]
+        result = self._diag(3, 2, set(), (0, 0), (2, 0), bad,
+                            dynamic_blocked=[[], [], [], [], [(2, 0)]])
+        self.assertEqual(result, {
+            "valid": False, "cost": None, "steps": None,
+            "error": "dynamic_blocked", "error_index": 4,
+        })
+        # Same guarantee for the other violation kinds.
+        result = self._diag(3, 3, {(2, 1)}, (0, 0), (2, 0), bad)
+        self.assertEqual(result, {
+            "valid": False, "cost": None, "steps": None,
+            "error": "static_blocked", "error_index": 3,
+        })
+
+    def test_diagnose_type_checked_after_grid_and_path_validation(self):
+        for bad in (1, 0, "true", None, 1.0, [True]):
+            with self.assertRaises(TypeError, msg=f"diagnose={bad!r}"):
+                replay(3, 3, set(), (0, 0), (2, 2),
+                       [(0, 0), (1, 0)], diagnose=bad)
+        # Grid ValueError precedes the diagnose TypeError.
+        with self.assertRaises(ValueError):
+            replay(0, 3, set(), (0, 0), (1, 1), [(0, 0)], diagnose=1)
+        # Grid TypeError precedes the diagnose TypeError.
+        with self.assertRaises(TypeError):
+            replay("3", 3, set(), (0, 0), (1, 1), [(0, 0)], diagnose=1)
+        # Endpoint-on-obstacle ValueError precedes it.
+        with self.assertRaises(ValueError):
+            replay(3, 3, {(0, 0)}, (0, 0), (2, 2), [(0, 0)], diagnose=1)
+        # Frame-zero ValueError precedes it.
+        with self.assertRaises(ValueError):
+            replay(3, 3, set(), (0, 0), (1, 1), [(0, 0)], diagnose=1,
+                   dynamic_blocked=[[(0, 0)]])
+        # Path-structure TypeError also precedes the diagnose TypeError.
+        with self.assertRaises(TypeError):
+            replay(3, 3, set(), (0, 0), (2, 2), "bad", diagnose=1)
+        with self.assertRaises(TypeError):
+            replay(3, 3, set(), (0, 0), (2, 2), [], diagnose=1)
+        with self.assertRaises(TypeError):
+            replay(3, 3, set(), (0, 0), (2, 2), [(0, 0), "x"],
+                   diagnose=1)
+        # Out-of-bounds path coordinate ValueError precedes it.
+        with self.assertRaises(ValueError):
+            replay(3, 3, set(), (0, 0), (2, 2), [(0, 0), (3, 0)],
+                   diagnose=1)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -1,3 +1,4 @@
+import random
 import unittest
 
 import app
@@ -253,6 +254,191 @@ class TraceTest(unittest.TestCase):
         # TypeError, preserving the existing validation order.
         with self.assertRaises(ValueError):
             plan(0, 3, set(), (0, 0), (1, 1), trace=1)
+
+
+class DynamicObstaclesTest(unittest.TestCase):
+    def assertValidDynamicPath(self, result, width, height, obstacles,
+                               frames):
+        path = result["path"]
+        self.assertIsNotNone(path)
+        last_frame = len(frames) - 1
+        self.assertEqual(len(set(path)), len(path))  # no repeated cells
+        for index, point in enumerate(path):
+            x, y = point
+            self.assertTrue(0 <= x < width and 0 <= y < height)
+            self.assertNotIn(point, obstacles)
+            self.assertNotIn(point, frames[min(index, last_frame)])
+        for a, b in zip(path, path[1:]):
+            # four-neighborhood moves only, never waiting in place
+            self.assertEqual(abs(a[0] - b[0]) + abs(a[1] - b[1]), 1)
+
+    def test_history_dependent_completeness(self):
+        # Reaching (1, 1) at t=2 via (1, 0) is the only viable history:
+        # the via-(0, 1) history is trapped by frame 2 blocking (0, 2).
+        # Merging the two histories at (x, y, t) wrongly returns None.
+        frames = [[], [], [(0, 2)], []]
+        result = plan(2, 4, {(1, 2)}, (0, 0), (1, 3),
+                      dynamic_blocked=frames)
+        self.assertEqual(
+            result["path"],
+            [(0, 0), (1, 0), (1, 1), (0, 1), (0, 2), (0, 3), (1, 3)],
+        )
+        self.assertEqual(result["cost"], 6)
+        self.assertValidDynamicPath(result, 2, 4, {(1, 2)},
+                                    [set(f) for f in frames])
+
+    def test_same_state_with_distinct_history_closed_twice(self):
+        # (1, 1, 2) is reached by two different histories:
+        # (0,0)->(1,0)->(1,1) and (0,0)->(0,1)->(1,1).
+        obstacles = {(1, 2), (2, 1)}
+        frames = [[(1, 0)], [(2, 2)], [(1, 0), (2, 2)]]
+        result = plan(3, 3, obstacles, (0, 0), (2, 2),
+                      dynamic_blocked=frames, trace=True)
+        self.assertIsNone(result["path"])
+        self.assertIsNone(result["cost"])
+        nodes = result["expanded_nodes"]
+        self.assertEqual(nodes.count((1, 1, 2)), 2)
+        self.assertEqual(result["expanded"], len(nodes))
+        first = nodes.index((1, 1, 2))
+        second = nodes.index((1, 1, 2), first + 1)
+        self.assertLess(first, second)
+        # Every recorded state is a timed triple.
+        self.assertTrue(all(isinstance(s, tuple) and len(s) == 3
+                            for s in nodes))
+
+    def test_start_equals_goal(self):
+        result = plan(3, 3, set(), (1, 1), (1, 1),
+                      dynamic_blocked=[[]], trace=True)
+        self.assertEqual(result, {
+            "path": [(1, 1)], "cost": 0, "expanded": 1,
+            "expanded_nodes": [(1, 1, 0)],
+        })
+
+    def test_empty_dynamic_blocked_matches_static(self):
+        blocked = {(1, 1), (2, 2)}
+        static = plan(4, 4, blocked, (0, 0), (3, 3), trace=True)
+        self.assertEqual(
+            plan(4, 4, blocked, (0, 0), (3, 3), trace=True,
+                 dynamic_blocked=[]),
+            static,
+        )
+        self.assertEqual(
+            plan(4, 4, blocked, (0, 0), (3, 3), trace=True,
+                 dynamic_blocked=None),
+            static,
+        )
+        no_trace = plan(4, 4, blocked, (0, 0), (3, 3))
+        self.assertEqual(
+            plan(4, 4, blocked, (0, 0), (3, 3), dynamic_blocked=[]),
+            no_trace,
+        )
+        self.assertNotIn(
+            "expanded_nodes",
+            plan(4, 4, blocked, (0, 0), (3, 3), dynamic_blocked=[]),
+        )
+
+    def test_trace_shape_in_dynamic_mode(self):
+        result = plan(3, 3, set(), (0, 0), (2, 2),
+                      dynamic_blocked=[[], [], []])
+        self.assertEqual(set(result), {"path", "cost", "expanded"})
+        traced = plan(3, 3, set(), (0, 0), (2, 2), trace=True,
+                      dynamic_blocked=[[], [], []])
+        self.assertEqual(set(traced),
+                         {"path", "cost", "expanded", "expanded_nodes"})
+        self.assertTrue(all(len(s) == 3 for s in traced["expanded_nodes"]))
+        self.assertEqual(traced["expanded_nodes"][0], (0, 0, 0))
+
+    def test_equal_cost_multi_history_is_deterministic(self):
+        # Open 3x3: many shortest routes tie on f, h, x, y, t; the path
+        # coordinate sequence breaks the tie and must be stable regardless
+        # of input ordering.
+        base = plan(3, 3, set(), (0, 0), (2, 2),
+                    dynamic_blocked=[[], [], [], [], [], []], trace=True)
+        orderings = [
+            [set(), set(), set(), set(), set(), set()],
+            [[], [], [], [], [], []],
+            [frozenset(), frozenset(), frozenset(), frozenset(),
+             frozenset(), frozenset()],
+        ]
+        for frames in orderings:
+            self.assertEqual(
+                plan(3, 3, set(), (0, 0), (2, 2),
+                     dynamic_blocked=frames, trace=True),
+                base,
+            )
+        self.assertEqual(base["cost"], 4)
+        self.assertValidDynamicPath(base, 3, 3, set(),
+                                    [set() for _ in range(6)])
+
+    def test_order_perturbation_never_changes_result(self):
+        obstacles = [(1, 3), (3, 3)]
+        frames = [[(2, 3), (4, 2)], [(3, 4)],
+                  [(1, 1), (2, 4), (3, 2)], []]
+        costs = [[2, 5, 4, 3, 5], [3, 5, 2, 5, 4], [3, 1, 2, 4, 3],
+                 [4, 1, 4, 1, 5], [2, 3, 3, 1, 5]]
+        base = plan(5, 5, obstacles, (0, 0), (4, 4), costs=costs,
+                    dynamic_blocked=frames, trace=True)
+        for seed in range(8):
+            rnd = random.Random(seed)
+            shuffled_frames = []
+            for frame in frames:
+                cells = list(frame) * 2
+                rnd.shuffle(cells)
+                shuffled_frames.append(cells)
+            shuffled_obstacles = list(obstacles) * 2
+            rnd.shuffle(shuffled_obstacles)
+            other = plan(5, 5, shuffled_obstacles, (0, 0), (4, 4),
+                         costs=costs, dynamic_blocked=shuffled_frames,
+                         trace=True)
+            self.assertEqual(other, base)
+
+    def test_unreachable_when_only_move_blocked(self):
+        # One-cell corridor; the only neighbor is blocked at t=1 and the
+        # last frame persists forever, so no waiting can help.
+        result = plan(2, 1, set(), (0, 0), (1, 0),
+                      dynamic_blocked=[[], [(1, 0)]], trace=True)
+        self.assertIsNone(result["path"])
+        self.assertIsNone(result["cost"])
+        self.assertEqual(result["expanded"], 1)
+        self.assertEqual(result["expanded_nodes"], [(0, 0, 0)])
+
+    def test_last_frame_reused_forever(self):
+        # Goal blocked at the last frame stays blocked at every later t.
+        result = plan(2, 1, set(), (0, 0), (1, 0),
+                      dynamic_blocked=[[], [(1, 0)]])
+        self.assertIsNone(result["path"])
+        self.assertIsNone(result["cost"])
+
+    def test_costs_are_charged_for_entered_cells(self):
+        result = plan(3, 1, set(), (0, 0), (2, 0),
+                      costs=[[1, 7, 1]],
+                      dynamic_blocked=[[], [], []])
+        self.assertEqual(result["path"], [(0, 0), (1, 0), (2, 0)])
+        self.assertEqual(result["cost"], 8)
+        # No waiting and no side move in one row: blocking (1,0) at t=1
+        # makes the goal unreachable even though it is free at t=2.
+        blocked = plan(3, 1, set(), (0, 0), (2, 0),
+                       dynamic_blocked=[[], [(1, 0)], []])
+        self.assertIsNone(blocked["path"])
+        self.assertIsNone(blocked["cost"])
+
+    def test_dynamic_validation_unchanged(self):
+        with self.assertRaises(ValueError):
+            plan(2, 2, set(), (0, 0), (1, 1),
+                 dynamic_blocked=[[(0, 0)]])
+        for bad in ("frames", 42, [1], [(1,)], [[(1.5, 0)]]):
+            with self.assertRaises((TypeError, ValueError), msg=f"{bad!r}"):
+                plan(2, 2, set(), (0, 0), (1, 1), dynamic_blocked=bad)
+        with self.assertRaises(ValueError):
+            plan(2, 2, set(), (0, 0), (1, 1),
+                 dynamic_blocked=[[(2, 0)]])
+        # In-frame duplicates merge: blocking a cell twice changes nothing.
+        once = plan(3, 3, set(), (0, 0), (2, 2),
+                    dynamic_blocked=[[], [(1, 0)], []], trace=True)
+        twice = plan(3, 3, set(), (0, 0), (2, 2),
+                     dynamic_blocked=[[], [(1, 0), (1, 0)], []],
+                     trace=True)
+        self.assertEqual(once, twice)
 
 
 if __name__ == '__main__':

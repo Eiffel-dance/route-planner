@@ -35,9 +35,13 @@ Dynamic obstacles (``dynamic_blocked``):
 - In dynamic mode ``expanded_nodes`` records ``(x, y, t)`` triples in
   closing order and ``expanded`` counts closed space-time states; on
   failure ``path``/``cost`` are ``None`` and ``expanded`` is the number of
-  space-time states actually closed. Tie-breaking compares f, then h,
-  then x, y, t, so results never depend on the iteration order of any
-  frame or coordinate set.
+  space-time states actually closed. Reaching the same ``(x, y, t)`` via
+  different coordinate histories creates distinct states, since the
+  no-repeat rule makes later feasibility depend on the cells already
+  visited: each such state is closed and recorded separately. Tie-breaking
+  compares f, then h, then x, y, t, and finally the complete path's
+  coordinate sequence lexicographically, so results never depend on the
+  iteration order of any frame or coordinate set.
 - Validation: the outer value must be a sequence and every frame an
   iterable of coordinates; strings/bytes and non-two-integer coordinates
   raise ``TypeError``, out-of-bounds coordinates raise ``ValueError``,
@@ -193,12 +197,22 @@ def _normalize_dynamic_blocked(dynamic_blocked, width, height):
 
 def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
                     trace):
-    """Time-expanded A* over (x, y, t) states.
+    """Time-expanded A* over complete space-time paths.
 
     Frame ``t`` constrains the cell occupied at path index ``t``; frames
     past the last one reuse the last frame. Waiting in place and repeated
-    coordinates are forbidden, so each state's ancestor cells are tracked
-    and excluded from its successors.
+    coordinates are forbidden. Whether a successor is feasible depends on
+    every cell visited along the way, so two candidates that reach the
+    same ``(x, y, t)`` with different histories are distinct states: the
+    state is the full tuple of coordinates of the path itself. Such states
+    can never be merged or pruned by ``g``, since a costlier history may
+    be the only one whose visited set still leaves a route open.
+
+    Every path state has exactly one parent (itself minus its last
+    coordinate) and is generated at most once, so every popped heap entry
+    is a genuine first closing: there are no stale entries and no separate
+    closed set. Paths are self-avoiding, hence bounded in length by the
+    number of grid cells, and the search always terminates.
     """
 
     def heuristic(point):
@@ -215,60 +229,48 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
     def frame_cells(t):
         return frames[t] if t <= last_frame else frames[last_frame]
 
-    # Heap entries are (f, h, x, y, t, state): the first five fields give
-    # a total, input-order-independent ordering, so the state itself is
-    # never compared.
-    start_state = (start[0], start[1], 0)
+    # Heap entries are (f, h, x, y, t, path, g). f/h and the space-time
+    # coordinate follow the fixed priority; when two distinct histories
+    # still tie, their complete coordinate sequences break ties
+    # lexicographically. This is a total, input-order-independent
+    # ordering, so ``g`` (which equals f - h) is never compared.
     h0 = heuristic(start)
-    open_heap = [(h0, h0, start[0], start[1], 0, start_state)]
-    came_from = {}
-    g_score = {start_state: 0}
-    ancestors = {start_state: frozenset((start,))}
-    closed = set()
+    start_path = (start,)
+    open_heap = [(h0, h0, start[0], start[1], 0, start_path, 0)]
     expanded_nodes = [] if trace else None
+    expanded = 0
 
     while open_heap:
-        _, _, _, _, _, state = heapq.heappop(open_heap)
-        if state in closed:
-            continue  # stale heap entry; already closed with its best g
-        closed.add(state)
+        _, _, x, y, t, path, g = heapq.heappop(open_heap)
+        expanded += 1
         if expanded_nodes is not None:
-            expanded_nodes.append(state)
-        current = (state[0], state[1])
+            expanded_nodes.append((x, y, t))
+        current = (x, y)
         if current == goal:
-            states = [state]
-            while states[-1] in came_from:
-                states.append(came_from[states[-1]])
-            states.reverse()
             result = {
-                "path": [(s[0], s[1]) for s in states],
-                "cost": g_score[state],
-                "expanded": len(closed),
+                "path": list(path),
+                "cost": g,
+                "expanded": expanded,
             }
             if trace:
                 result["expanded_nodes"] = expanded_nodes
             return result
-        next_t = state[2] + 1
+        next_t = t + 1
         frame = frame_cells(next_t)
-        seen = ancestors[state]
         for dx, dy in _NEIGHBORS:
-            nxt = (current[0] + dx, current[1] + dy)
+            nxt = (x + dx, y + dy)
             if not (0 <= nxt[0] < width and 0 <= nxt[1] < height):
                 continue
-            if nxt in obstacles or nxt in frame or nxt in seen:
+            if nxt in obstacles or nxt in frame or nxt in path:
                 continue
-            next_state = (nxt[0], nxt[1], next_t)
-            new_g = g_score[state] + step_cost(nxt)
-            if new_g < g_score.get(next_state, float("inf")):
-                g_score[next_state] = new_g
-                came_from[next_state] = state
-                ancestors[next_state] = seen | {nxt}
-                h = heuristic(nxt)
-                heapq.heappush(
-                    open_heap,
-                    (new_g + h, h, nxt[0], nxt[1], next_t, next_state),
-                )
-    result = {"path": None, "cost": None, "expanded": len(closed)}
+            new_g = g + step_cost(nxt)
+            h = heuristic(nxt)
+            next_path = path + (nxt,)
+            heapq.heappush(
+                open_heap,
+                (new_g + h, h, nxt[0], nxt[1], next_t, next_path, new_g),
+            )
+    result = {"path": None, "cost": None, "expanded": expanded}
     if trace:
         result["expanded_nodes"] = expanded_nodes
     return result

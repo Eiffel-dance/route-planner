@@ -19,6 +19,15 @@ Tests: python3 -m unittest discover -s tests -v
 - 预算对静态与动态模式同样生效，且不改变扩展顺序、路径选择、轨迹条目或确定性：带预算的轨迹是无预算轨迹的前缀。`trace=True` 时只记录实际关闭的节点，预算为零时即使 `start == goal` 也返回 `budget_exhausted`（`expanded` 为 0，`expanded_nodes` 为空）；单点成功结果要求至少关闭一个节点（`max_expanded >= 1`）。
 - `replay` 不受预算影响：不接受预算参数，仍只校验候选路径。
 
+`plan_any(width, height, blocked, start, goals, costs=None, trace=False, dynamic_blocked=None, max_expanded=None)` 接受与 `plan` 相同的网格、`blocked`、`start` 及可选代价、轨迹、动态障碍和预算参数，另收一个非空 `goals` 候选终点序列，返回一条确定的最低代价路线（返回结构与 `plan` 相同，`path` 末点为选中的候选终点）；该路径可直接以其末点作为 `goal` 交给 `replay` 离线核验。
+
+**多终点（`goals`）**
+- 外层必须是非空序列：字符串、字节串、`None` 或其他非序列抛 `TypeError`，空序列抛 `ValueError`。每个终点沿用坐标的结构和整数规则：元素形状或坐标类型不合格抛 `TypeError`，越界或落在静态障碍上抛 `ValueError`。`goals` 在 `plan` 校验序列中占据 `goal` 的位置，网格、`costs`、`trace`、`dynamic_blocked` 与预算的校验顺序及异常类型沿用 `plan`；`start` 仍须通过静态障碍与动态第 0 帧检查。
+- 重复候选点合并，输入排列（以及 `blocked`、帧内坐标的迭代顺序）不影响任何结果。
+- 候选终点在某条路线到达的时间帧被动态障碍阻挡时不在输入阶段报错：该路线按其时间帧不可达，其他到达时刻仍可参与竞争；末帧之后持续使用最后一帧。
+- 搜索保留四邻域移动、禁止等待和回访、进入格子的代价累计。总 `cost` 最小者优先；同价时先比较终点坐标 `(x, y)` 字典序，再比较完整路径字典序。与动态 `plan` 同理，经不同历史到达同一格子的路线是不同状态、互不剪枝；`trace` 在静态模式记录坐标二元组、动态模式记录 `(x, y, t)` 三元组，且只记录实际关闭的节点。
+- 没有任何可行终点时 `path`/`cost` 为 `None`；提供预算时按既有规则返回 `status` 为 `found`、`unreachable` 或 `budget_exhausted`，预算不会把已确定的较优路线替换成严格次优（更贵）的路线。`goals` 含 `start` 时按既有 `start == goal` 单点零代价规则处理（零预算同样为 `budget_exhausted`）。
+
 `replay(width, height, blocked, start, goal, path, costs=None, dynamic_blocked=None, diagnose=False)` 用于离线核验一条已保存的候选路径并重新计算代价；它不执行搜索，返回值不含 `expanded` 或 `expanded_nodes` 字段，且不接受 `trace` 参数。
 
 **诊断模式（`diagnose=True`）**

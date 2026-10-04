@@ -1,7 +1,9 @@
 """Deterministic 2D grid A* planner.
 
 Public entry points: ``plan(width, height, blocked, start, goal, costs=None,
-trace=False, dynamic_blocked=None, max_expanded=None)`` and
+trace=False, dynamic_blocked=None, max_expanded=None)``,
+``plan_any(width, height, blocked, start, goals, costs=None, trace=False,
+dynamic_blocked=None, max_expanded=None)`` and
 ``replay(width, height, blocked, start, goal, path, costs=None,
 dynamic_blocked=None, diagnose=False)``.
 
@@ -82,6 +84,46 @@ Dynamic obstacles (``dynamic_blocked``):
   duplicates within a frame are merged, and a ``start`` blocked at frame 0
   raises ``ValueError``. All checks run before the search starts.
 
+Multi-goal planning (``plan_any``):
+- ``plan_any(width, height, blocked, start, goals, ...)`` accepts the same
+  grid, blocked, start, costs, trace, dynamic_blocked and max_expanded
+  arguments as ``plan``, plus a non-empty ``goals`` sequence of candidate
+  endpoint coordinates. It returns one deterministic minimum-cost route to
+  any of the candidates, in the same result structure as ``plan``; the
+  path's last point is the winning endpoint.
+- The grid, costs, trace, dynamic-blocked and budget checks run in
+  ``plan``'s order with the same exception types; ``goals`` takes
+  ``goal``'s position in that sequence. The outer value must be a
+  sequence: strings, bytes, ``None`` and other non-sequences raise
+  ``TypeError`` and an empty sequence raises ``ValueError``. Each endpoint
+  follows the coordinate structure and integer rules (bad shape or
+  coordinate types raise ``TypeError``); out-of-bounds coordinates and
+  endpoints on static obstacles raise ``ValueError``. Repeated candidates
+  merge, so the input ordering never changes any result.
+- The search keeps four-neighborhood moves, no waiting, no revisits, the
+  persistent last frame and the entering-cell cost accumulation. A
+  candidate blocked by the dynamic frame at the time a particular route
+  arrives is not rejected up front (its coordinate is statically valid);
+  that arrival is simply infeasible for that route's time frame while
+  other arrival times still compete.
+- Total ``cost`` decides; ties compare the endpoint coordinate ``(x, y)``
+  lexicographically, then the complete coordinate path lexicographically.
+  As in dynamic ``plan``, routes reaching the same cell through different
+  coordinate histories are distinct states and are never merged, so the
+  traversal is a best-first walk of the feasible route tree; expansion
+  order and the trace never depend on goal order, the blocked sets or
+  in-frame iteration order. A budget never replaces an already determined
+  better route with a worse one.
+- When no endpoint is reachable, ``path`` and ``cost`` are ``None``. With a
+  budget the ``status`` field follows the same ``"found"``,
+  ``"unreachable"`` and ``"budget_exhausted"`` rules, and ``trace`` only
+  records actually closed nodes: coordinate pairs in static mode and
+  ``(x, y, t)`` triples in dynamic mode. A ``goals`` containing ``start``
+  yields the single-point zero-cost route under the same start-equals-goal
+  and zero-budget rules as ``plan``. A successful path verifies offline in
+  ``replay`` when its last point is passed as ``goal``, with the same cost
+  and step count.
+
 Offline replay (``replay``):
 - ``replay`` re-checks a saved candidate path without running any search;
   it never returns ``expanded`` or ``expanded_nodes``. It accepts the same
@@ -140,7 +182,7 @@ Validation (all performed before the search starts):
 import heapq
 from collections.abc import Iterable, Sequence
 
-__all__ = ["plan", "replay"]
+__all__ = ["plan", "plan_any", "replay"]
 
 # Fixed neighbor generation order: +x, -x, +y, -y.
 _NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1))
@@ -287,6 +329,31 @@ def _normalize_path(path, width, height):
     return points
 
 
+def _normalize_goals(goals):
+    # ``goals`` is the plan_any counterpart of ``plan``'s single ``goal``.
+    # This performs the outer/structure pass in exactly the position where
+    # ``plan`` structurally normalizes ``goal``: strings, bytes, ``None``
+    # and other non-sequences are ``TypeError`` and an empty sequence is a
+    # ``ValueError``; every element is normalized to a coordinate tuple
+    # (element shape/coordinate type failures are ``TypeError``). Bounds and
+    # obstacle checks follow in ``plan_any`` at the same relative positions
+    # ``plan`` uses for its single goal. Duplicates merge and the tuple is
+    # sorted so the input order never affects the result.
+    if (goals is None or isinstance(goals, (str, bytes))
+            or not isinstance(goals, Sequence)):
+        raise TypeError(
+            f"goals must be a non-empty sequence of grid coordinates, "
+            f"got {type(goals).__name__}"
+        )
+    if len(goals) == 0:
+        raise ValueError("goals must contain at least one candidate endpoint")
+    points = set()
+    for index, item in enumerate(goals):
+        point = _normalize_point(item, f"goals[{index}]")
+        points.add(point)
+    return tuple(sorted(points))
+
+
 def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
                     trace, max_expanded):
     """History-sensitive time-expanded A*.
@@ -385,6 +452,146 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
             continue  # routes end at the goal; never expanded past it
         next_t = t + 1
         frame = frame_cells(next_t)
+        for dx, dy in _NEIGHBORS:
+            nx, ny = x + dx, y + dy
+            if not (0 <= nx < width and 0 <= ny < height):
+                continue
+            nxt = (nx, ny)
+            if nxt in obstacles or nxt in frame or nxt in seen:
+                continue  # static obstacle, timed obstacle, or revisit
+            new_g = g + step_cost(nxt)
+            new_path = path + (nxt,)
+            h = heuristic(nxt)
+            heapq.heappush(
+                open_heap,
+                (new_g + h, h, nx, ny, next_t, new_g, new_path,
+                 seen | {nxt}),
+            )
+    if best_key is None:
+        result = {"path": None, "cost": None, "expanded": closed_count}
+        if max_expanded is not None:
+            result["status"] = (
+                "budget_exhausted" if budget_stop else "unreachable"
+            )
+    else:
+        best_g, _, best_path = best_key
+        result = {
+            "path": list(best_path),
+            "cost": best_g,
+            "expanded": closed_count,
+        }
+        if max_expanded is not None:
+            result["status"] = "found"
+    if trace:
+        result["expanded_nodes"] = expanded_nodes
+    return result
+
+
+def _search_any(width, height, obstacles, frames, start, goals, costs,
+                trace, max_expanded):
+    """History-sensitive time-expanded A* over several candidate goals.
+
+    This is the ``plan_any`` counterpart of ``_search_dynamic``. The only
+    semantic differences are: the heuristic is the minimum Manhattan
+    distance to any candidate endpoint, and a closing at any goal
+    coordinate is a goal closing that terminates the route. As in ``_search_dynamic`` the feasibility
+    of a route depends on its exact coordinate history (no waiting, no
+    repeated coordinates, and dynamic frames), so every node carries its
+    complete path and routes reaching the same cell through different
+    histories are never merged; this is also what makes the complete-path
+    lexicographic tie-break exact. Static mode is the same traversal with
+    the time dimension fixed at 0 and no timed frames, so the trace records
+    plain coordinate pairs there, exactly as ``plan`` does.
+    """
+
+    def heuristic(point):
+        return min(
+            abs(point[0] - goal[0]) + abs(point[1] - goal[1])
+            for goal in goals
+        )
+
+    def step_cost(point):
+        # Cost of entering ``point``; the start cell is never entered.
+        if costs is None:
+            return 1
+        return costs[point[1]][point[0]]
+
+    dynamic = frames is not None
+    last_frame = len(frames) - 1 if dynamic else None
+
+    def frame_cells(t):
+        return frames[t] if t <= last_frame else frames[last_frame]
+
+    if start in goals:
+        # Single-point, zero-cost result; frame 0 was checked upstream.
+        # A zero budget closes nothing, so even this trivial case stops.
+        if max_expanded is not None and max_expanded < 1:
+            result = {
+                "path": None,
+                "cost": None,
+                "expanded": 0,
+                "status": "budget_exhausted",
+            }
+            if trace:
+                result["expanded_nodes"] = []
+            return result
+        result = {"path": [start], "cost": 0, "expanded": 1}
+        if max_expanded is not None:
+            result["status"] = "found"
+        if trace:
+            result["expanded_nodes"] = [
+                (start[0], start[1], 0) if dynamic else start
+            ]
+        return result
+
+    h0 = heuristic(start)
+    # Heap entries are (f, h, x, y, t, g, path, seen), keyed exactly like
+    # ``_search_dynamic``: the fixed numeric priority comes first and
+    # candidates still tied are ordered by the complete coordinate path
+    # lexicographically, so ordering never depends on goal order, obstacle
+    # sets, in-frame coordinate order, or traversal order. Static mode keeps
+    # t fixed at 0; the frozenset ``seen`` mirrors ``path`` for an O(1)
+    # repeat check and is never compared.
+    start_path = (start,)
+    open_heap = [(h0, h0, start[0], start[1], 0, 0, start_path,
+                  frozenset(start_path))]
+    closed_count = 0
+    expanded_nodes = [] if trace else None
+    # Best goal closing seen so far, keyed as (g, (x, y), path): minimum
+    # total cost first, then the endpoint coordinate's lexicographic order,
+    # then the complete route's lexicographic order. Closing a goal does not
+    # stop the search immediately: an equally cheap route to a smaller goal
+    # whose chain runs through higher-h nodes might still be undeveloped.
+    # Every move costs at least 1 and the minimum Manhattan heuristic
+    # changes by at most 1 per move, so f = g + h never decreases along a
+    # route; once the smallest f on the heap exceeds the best goal cost, no
+    # route of that cost (or less) can remain undiscovered.
+    best_key = None
+    budget_stop = False
+
+    while open_heap:
+        if best_key is not None and open_heap[0][0] > best_key[0]:
+            break
+        if max_expanded is not None and closed_count >= max_expanded:
+            # Live route candidates remain but the budget is spent; close
+            # nothing more. A goal already closed still wins below.
+            budget_stop = True
+            break
+        _, _, x, y, t, g, path, seen = heapq.heappop(open_heap)
+        closed_count += 1  # every popped route node closes exactly once
+        if expanded_nodes is not None:
+            # Static mode records coordinate pairs, dynamic mode the
+            # (x, y, t) triple; distinct histories each record an entry in
+            # actual closing order.
+            expanded_nodes.append((x, y, t) if dynamic else (x, y))
+        cell = (x, y)
+        if cell in goals:
+            goal_key = (g, cell, path)
+            if best_key is None or goal_key < best_key:
+                best_key = goal_key
+            continue  # routes end at a goal; never expanded past one
+        next_t = t + 1 if dynamic else 0
+        frame = frame_cells(next_t) if dynamic else frozenset()
         for dx, dy in _NEIGHBORS:
             nx, ny = x + dx, y + dy
             if not (0 <= nx < width and 0 <= ny < height):
@@ -532,6 +739,53 @@ def plan(width, height, blocked, start, goal, costs=None, trace=False,
     if trace:
         result["expanded_nodes"] = expanded_nodes
     return result
+
+
+def plan_any(width, height, blocked, start, goals, costs=None, trace=False,
+             dynamic_blocked=None, max_expanded=None):
+    # --- Validation: ``goals`` takes ``goal``'s exact position in       ---
+    # --- ``plan``'s validation sequence; every shared check keeps its   ---
+    # --- order, exception type and message boundary.                    ---
+    width = _validate_dimension(width, "width")
+    height = _validate_dimension(height, "height")
+    start = _normalize_point(start, "start")
+    goal_points = _normalize_goals(goals)
+    _check_bounds(start, width, height, "start")
+    for point in goal_points:
+        _check_bounds(point, width, height, "goal")
+    obstacles = _normalize_blocked(blocked, width, height)
+    if start in obstacles:
+        raise ValueError(f"start {start} lies on a blocked cell")
+    for point in goal_points:
+        if point in obstacles:
+            raise ValueError(f"goal {point} lies on a blocked cell")
+    costs = _normalize_costs(costs, width, height)
+    if not isinstance(trace, bool):
+        raise TypeError(
+            f"trace must be a bool, got {type(trace).__name__}"
+        )
+    frames = _normalize_dynamic_blocked(dynamic_blocked, width, height)
+    if frames is not None and start in frames[0]:
+        raise ValueError(
+            f"start {start} is blocked at frame 0"
+        )
+    # The budget stays the last check before the search, exactly as in
+    # ``plan``.
+    if max_expanded is not None:
+        if not _is_int(max_expanded):
+            raise TypeError(
+                f"max_expanded must be an int, "
+                f"got {type(max_expanded).__name__}"
+            )
+        if max_expanded < 0:
+            raise ValueError(
+                f"max_expanded must be a non-negative integer, "
+                f"got {max_expanded}"
+            )
+    return _search_any(
+        width, height, obstacles, frames, start, goal_points, costs, trace,
+        max_expanded
+    )
 
 
 def replay(width, height, blocked, start, goal, path, costs=None,

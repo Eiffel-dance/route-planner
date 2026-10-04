@@ -48,6 +48,13 @@ Tests: python3 -m unittest discover -s tests -v
 - `max_expanded` 按实际关闭的完整路径候选计数（即 `expanded` 的口径），达到上限后不得再关闭任何候选；它只能截断搜索，不能替换已经确定的前若干名结果。提前结束时仍返回已关闭的路线与逐项对应的代价并保留排名顺序，一条都没有时使用空列表，`expanded` 为实际关闭数。
 - `status` 取值：凑齐 `k` 条路线，或搜索自然耗尽但至少找到一条路线时为 `"found"`；未凑齐 `k` 且扩展上限截断时仍有待处理候选为 `"budget_exhausted"`；未凑齐 `k`、未发生预算截断且至少一个候选因代价上限被丢弃为 `"cost_exhausted"`；没有任何路线且既无预算截断也无代价丢弃时为 `"unreachable"`。两种截断同时发生时 `"budget_exhausted"` 优先。动态模式继续沿用持久化末帧、禁止等待、禁止回访和可由 `replay` 验证的语义。
 
+`plan_batch(width, height, blocked, requests, costs=None, trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None)` 在一次调用中处理同一共享栅格上的多个独立单起点单终点查询：返回 `{"results": [...]}`，按 `requests` 顺序给出每个查询逐次调用 `plan` 应得到的结果；重复请求保留并各自独立作答。
+
+**批量规划（`requests`）**
+- 共享参数（尺寸、`blocked`、`costs`、`trace`、`dynamic_blocked`、`max_expanded`、`snapshot`、`max_cost`）沿用 `plan` 的校验规则与顺序；`requests` 在校验序列中占据 `start`/`goal` 的位置。`requests` 必须是非空序列：`None`、字符串、字节串或其他非序列抛 `TypeError`，空序列抛 `ValueError`。每个元素必须是恰好含两个坐标的二元序列 `[start, goal]`：元素形状或坐标类型错误抛 `TypeError`；坐标越界、端点落在静态障碍上、动态第 0 帧阻塞某个起点抛 `ValueError`。全部校验在任意搜索开始前完成，非法批次绝不返回部分结果。
+- 每个查询都是一次独立的 `plan` 搜索：`path`、`cost`、`expanded` 按请求分别产生，`max_expanded` 预算与 `max_cost` 上限按查询各自生效，查询之间不共享任何搜索状态。`trace`、`status`、`expanded_nodes`、`checkpoint`、动态帧、`start == goal`、不可达与 `cost_exhausted` 的语义与 `plan` 完全一致；`budget_exhausted` 结果携带的 `checkpoint` 可直接交给 `resume` 继续。
+- 成功路径以其对应 `goal` 结尾，可逐条交给 `replay` 离线核验并得到相同代价与步数。重复障碍与帧内坐标合并，障碍集合或 `requests` 的排列不改变任何单条结果；整个返回对象可 JSON 序列化保存。
+
 `distance_field(width, height, blocked, goal, costs=None, trace=False)` 与 `distance_field_any(width, height, blocked, goals, costs=None, trace=False)` 是面向静态栅格的离线分析入口：一次分析给出到单个或多个候选终点的最低代价场；不接受 `start`、`dynamic_blocked`、`max_expanded`、`max_cost`、`snapshot` 或其他控制参数，也不生成 `status`。
 
 **单终点代价场（`distance_field`）**

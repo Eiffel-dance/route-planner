@@ -7,6 +7,9 @@ costs=None, trace=False, dynamic_blocked=None, max_expanded=None,
 snapshot=False, max_cost=None)``,
 ``plan_k(width, height, blocked, start, goal, k, costs=None,
 dynamic_blocked=None, max_expanded=None, max_cost=None)``,
+``plan_batch(width, height, blocked, requests, costs=None, trace=False,
+dynamic_blocked=None, max_expanded=None, snapshot=False,
+max_cost=None)``,
 ``replay(width, height, blocked, start, goal, path, costs=None,
 dynamic_blocked=None, diagnose=False)``,
 ``resume(checkpoint, max_expanded=None)``,
@@ -226,6 +229,36 @@ Top-k planning (``plan_k``):
   actual closed count. Omitting both limits keeps every legacy key and
   value exactly unchanged.
 
+Batch planning (``plan_batch``):
+- ``plan_batch(width, height, blocked, requests, costs=None,
+  trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False,
+  max_cost=None)`` answers several independent single-goal queries on
+  one shared grid in a single call. It returns ``{"results": [...]}``
+  with exactly the result ``plan`` would return for each query, in the
+  order of ``requests``; duplicate requests are kept and each gets its
+  own result.
+- The shared arguments are validated with ``plan``'s rules and order,
+  with ``requests`` taking the position of ``start``/``goal`` in that
+  sequence. ``requests`` must be a non-empty sequence: ``None``,
+  strings, bytes and other non-sequences raise ``TypeError`` and an
+  empty sequence raises ``ValueError``. Each element must be a
+  two-element sequence ``[start, goal]`` of grid coordinates: element
+  shape or coordinate type failures raise ``TypeError``; out-of-bounds
+  coordinates, endpoints on static obstacles and a start blocked at
+  dynamic frame 0 raise ``ValueError``. Every check is decided before
+  any search starts, so an invalid batch never returns partial results.
+- Each query is an independent ``plan`` search over the shared grid:
+  ``path``, ``cost`` and ``expanded`` are produced per request, and the
+  ``max_expanded`` budget and the ``max_cost`` limit apply per query
+  with no state shared across queries. ``trace``, ``status``,
+  ``expanded_nodes``, ``checkpoint``, dynamic frames, ``start == goal``,
+  unreachable and ``cost_exhausted`` results all follow ``plan``
+  exactly, and a returned ``checkpoint`` can be handed to ``resume``
+  directly. A successful path ends at its request's goal and verifies
+  offline in ``replay`` with the same cost and step count. The result
+  never depends on obstacle-set iteration order, in-frame coordinate
+  order or the permutation of ``requests``.
+
 Snapshots and resumable planning (``snapshot`` and ``resume``):
 - ``plan`` and ``plan_any`` accept a final ``snapshot=False`` option.
   Omitting it or passing ``False`` keeps every key, value, exception type,
@@ -392,6 +425,9 @@ Validation (all performed before the search starts):
 - ``goals`` (``plan_any`` and ``distance_field_any``) must be a
   non-empty sequence of grid coordinates following the same rules,
   normalized, deduplicated and order-independent.
+- ``requests`` (``plan_batch``) must be a non-empty sequence of
+  two-element ``[start, goal]`` coordinate pairs following the same
+  coordinate rules, with the input order and duplicates preserved.
 - ``costs`` may be omitted or ``None`` (unit costs). Otherwise it must be a
   sequence of ``height`` rows, each a sequence of ``width`` positive
   integers; strings/bytes, non-integer cells and booleans are rejected.
@@ -405,7 +441,7 @@ Validation (all performed before the search starts):
 import heapq
 from collections.abc import Iterable, Sequence
 
-__all__ = ["plan", "plan_any", "plan_k", "replay", "resume",
+__all__ = ["plan", "plan_any", "plan_k", "plan_batch", "replay", "resume",
            "distance_field", "distance_field_any"]
 
 # Fixed neighbor generation order: +x, -x, +y, -y.
@@ -580,6 +616,45 @@ def _normalize_goals(goals):
         point = _normalize_point(item, f"goals[{index}]")
         points.add(point)
     return tuple(sorted(points))
+
+
+def _normalize_requests(requests):
+    # ``requests`` is the plan_batch counterpart of ``plan``'s
+    # ``start``/``goal`` pair. This performs the outer/structure pass in
+    # exactly the position where ``plan`` structurally normalizes its
+    # endpoints: strings, bytes, ``None`` and other non-sequences are
+    # ``TypeError`` and an empty sequence is a ``ValueError``. Every
+    # element must be a [start, goal] pair of grid coordinates (element
+    # shape or coordinate type failures are ``TypeError``); bounds and
+    # obstacle checks follow in ``plan_batch`` at the same relative
+    # positions ``plan`` uses for its endpoints. The input order and
+    # duplicate requests are preserved: every element gets its own
+    # independent result.
+    if (requests is None or isinstance(requests, (str, bytes))
+            or not isinstance(requests, Sequence)):
+        raise TypeError(
+            f"requests must be a non-empty sequence of [start, goal] "
+            f"coordinate pairs, got {type(requests).__name__}"
+        )
+    if len(requests) == 0:
+        raise ValueError("requests must contain at least one query")
+    pairs = []
+    for index, item in enumerate(requests):
+        name = f"requests[{index}]"
+        if isinstance(item, (str, bytes)) or not isinstance(item, Sequence):
+            raise TypeError(
+                f"{name} must be a [start, goal] pair of grid "
+                f"coordinates, got {type(item).__name__}"
+            )
+        if len(item) != 2:
+            raise TypeError(
+                f"{name} must contain exactly two coordinates, "
+                f"got {len(item)}"
+            )
+        start = _normalize_point(item[0], f"{name} start")
+        goal = _normalize_point(item[1], f"{name} goal")
+        pairs.append((start, goal))
+    return pairs
 
 
 def _validate_budget(max_expanded):
@@ -2086,6 +2161,67 @@ def plan_any(width, height, blocked, start, goals, costs=None, trace=False,
         width, height, obstacles, frames, start, goal_points, costs, trace,
         max_expanded, max_cost, snapshot
     )
+
+
+def plan_batch(width, height, blocked, requests, costs=None, trace=False,
+               dynamic_blocked=None, max_expanded=None, snapshot=False,
+               max_cost=None):
+    # --- Validation: ``plan``'s shared checks in their usual order,    ---
+    # --- with ``requests`` occupying the position of ``start``/``goal``---
+    # --- in that sequence. Every check is decided before any search    ---
+    # --- begins, so an invalid batch never returns partial results.    ---
+    width = _validate_dimension(width, "width")
+    height = _validate_dimension(height, "height")
+    pairs = _normalize_requests(requests)
+    for index, (start, goal) in enumerate(pairs):
+        _check_bounds(start, width, height, f"requests[{index}] start")
+        _check_bounds(goal, width, height, f"requests[{index}] goal")
+    obstacles = _normalize_blocked(blocked, width, height)
+    for index, (start, goal) in enumerate(pairs):
+        if start in obstacles:
+            raise ValueError(
+                f"requests[{index}] start {start} lies on a blocked cell"
+            )
+        if goal in obstacles:
+            raise ValueError(
+                f"requests[{index}] goal {goal} lies on a blocked cell"
+            )
+    costs = _normalize_costs(costs, width, height)
+    if not isinstance(trace, bool):
+        raise TypeError(
+            f"trace must be a bool, got {type(trace).__name__}"
+        )
+    frames = _normalize_dynamic_blocked(dynamic_blocked, width, height)
+    if frames is not None:
+        for index, (start, _) in enumerate(pairs):
+            if start in frames[0]:
+                raise ValueError(
+                    f"requests[{index}] start {start} is blocked at "
+                    f"frame 0"
+                )
+    # The budget, snapshot flag and cost limit keep ``plan``'s positions:
+    # after every grid and requests check and before any search starts.
+    _validate_budget(max_expanded)
+    _validate_snapshot_flag(snapshot)
+    _validate_max_cost(max_cost)
+    # Each request is an independent ``plan`` search over the shared,
+    # already normalized grid: ``path``/``cost``/``expanded`` are
+    # produced per query and the budget and cost limit apply per query,
+    # so no search state is ever shared between requests. The input
+    # order and duplicate requests are preserved in the results.
+    results = []
+    for start, goal in pairs:
+        if frames is not None:
+            results.append(_search_dynamic(
+                width, height, obstacles, frames, start, goal, costs,
+                trace, max_expanded, max_cost, snapshot
+            ))
+        else:
+            results.append(_search_static(
+                width, height, obstacles, start, goal, costs, trace,
+                max_expanded, max_cost, snapshot
+            ))
+    return {"results": results}
 
 
 def plan_k(width, height, blocked, start, goal, k, costs=None,

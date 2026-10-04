@@ -6,8 +6,10 @@ max_cost=None)``, ``plan_any(width, height, blocked, start, goals,
 costs=None, trace=False, dynamic_blocked=None, max_expanded=None,
 snapshot=False, max_cost=None)``,
 ``replay(width, height, blocked, start, goal, path, costs=None,
-dynamic_blocked=None, diagnose=False)`` and
-``resume(checkpoint, max_expanded=None)``.
+dynamic_blocked=None, diagnose=False)``,
+``resume(checkpoint, max_expanded=None)`` and
+``plan_k(width, height, blocked, start, goal, k, costs=None,
+dynamic_blocked=None)``.
 
 Semantics:
 - Four-neighborhood moves, Manhattan heuristic. Without ``costs`` each step
@@ -243,6 +245,33 @@ Offline replay (``replay``):
   ties resolve to the earliest rule in this list and no partial cost is
   ever returned.
 
+K-best planning (``plan_k``):
+- ``plan_k(width, height, blocked, start, goal, k, costs=None,
+  dynamic_blocked=None)`` returns up to ``k`` distinct feasible routes
+  on the same grid, ranked for offline comparison. The dimension,
+  coordinate, static-obstacle, costs-matrix and dynamic-frame checks
+  are exactly ``plan``'s (same order, same exception types); ``k`` is
+  checked after all of them and must be a positive integer that is not
+  a bool: other types raise ``TypeError`` and non-positive values raise
+  ``ValueError``. Every error is decided before the search starts.
+- The search keeps four-neighborhood moves, the zero-cost start, the
+  entering-cell cost accumulation, the static and per-frame dynamic
+  obstacles, the persistent last frame, and the no-wait/no-revisit
+  rules. Different complete coordinate sequences are different
+  candidates and are never merged, even when they reach the same cell.
+- The result always carries ``paths``, ``costs`` and ``expanded``:
+  ``paths`` holds at most ``k`` unique routes ordered by total cost,
+  ties broken by the complete coordinate sequence lexicographically,
+  and ``costs`` matches it item for item; with no feasible route both
+  are empty. ``expanded`` counts the candidate routes actually closed
+  to determine the top ``k`` -- each complete history exactly once;
+  filtered or never-closed candidates are not counted.
+- ``start == goal`` yields the single-point zero-cost route with one
+  expansion under the usual rule. Every returned route, static or
+  dynamic, verifies in ``replay`` with the same cost and step count,
+  and no result depends on the iteration order of the obstacle sets,
+  the goal argument, the cost matrix or the dynamic frames.
+
 Validation (all performed before the search starts):
 - ``width``/``height`` must be positive integers.
 - ``start``, ``goal`` and every entry of ``blocked`` must be grid
@@ -261,7 +290,7 @@ Validation (all performed before the search starts):
 import heapq
 from collections.abc import Iterable, Sequence
 
-__all__ = ["plan", "plan_any", "replay", "resume"]
+__all__ = ["plan", "plan_any", "plan_k", "replay", "resume"]
 
 # Fixed neighbor generation order: +x, -x, +y, -y.
 _NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1))
@@ -459,6 +488,16 @@ def _validate_snapshot_flag(snapshot):
         raise TypeError(
             f"snapshot must be a bool, got {type(snapshot).__name__}"
         )
+
+
+def _validate_k(k):
+    # The ``plan_k`` route-count rules: ``k`` must be a positive integer
+    # that is not a bool; other types raise ``TypeError`` and
+    # non-positive values raise ``ValueError``.
+    if not _is_int(k):
+        raise TypeError(f"k must be an int, got {type(k).__name__}")
+    if k <= 0:
+        raise ValueError(f"k must be a positive integer, got {k}")
 
 
 def _validate_max_cost(max_cost):
@@ -889,6 +928,98 @@ def _search_any(width, height, obstacles, frames, start, goals, costs,
                                  cost_limited, max_cost),
         )
     return result
+
+
+def _search_k(width, height, obstacles, frames, start, goal, costs, k):
+    """Best-first route-tree traversal collecting the k cheapest routes.
+
+    This is the ``plan_k`` search. As in ``_search_dynamic`` the
+    feasibility of a route depends on its exact coordinate history (no
+    waiting, no repeated coordinates, and dynamic frames), so every
+    node carries its complete path and routes reaching the same cell
+    through different histories are distinct candidates that are never
+    merged -- different complete coordinate sequences are different
+    routes even when they arrive at the same position. Static mode is
+    the same traversal with the time dimension fixed at 0 and no timed
+    frames. Goal closings are collected in non-decreasing cost order
+    (f = g + h never decreases along a route and f == g at the goal);
+    once ``k`` goal routes are closed and the heap's smallest f exceeds
+    the k-th route's cost, no undiscovered route can displace them, and
+    the final ranking is total cost, then the complete coordinate
+    sequence lexicographically. ``expanded`` counts exactly the route
+    candidates popped and closed; candidates that are filtered out
+    (blocked, revisiting) or never closed are not counted.
+    """
+
+    def heuristic(point):
+        return abs(point[0] - goal[0]) + abs(point[1] - goal[1])
+
+    def step_cost(point):
+        # Cost of entering ``point``; the start cell is never entered.
+        if costs is None:
+            return 1
+        return costs[point[1]][point[0]]
+
+    dynamic = frames is not None
+    last_frame = len(frames) - 1 if dynamic else None
+
+    def frame_cells(t):
+        return frames[t] if t <= last_frame else frames[last_frame]
+
+    # Heap entries are (f, h, x, y, t, g, path, seen), keyed exactly like
+    # ``_search_dynamic``: the fixed numeric priority comes first and
+    # candidates still tied are ordered by the complete coordinate path
+    # lexicographically, so ordering never depends on obstacle sets,
+    # in-frame coordinate order, or traversal order. Static mode keeps t
+    # fixed at 0; the frozenset ``seen`` mirrors ``path`` for an O(1)
+    # repeat check and is never compared.
+    h0 = heuristic(start)
+    start_path = (start,)
+    open_heap = [(h0, h0, start[0], start[1], 0, 0, start_path,
+                  frozenset(start_path))]
+    closed_count = 0
+    # Goal routes closed so far as (g, path), in closing order; g is
+    # non-decreasing because heap pops are non-decreasing in f and a
+    # goal's f equals its g.
+    goal_routes = []
+
+    while open_heap:
+        if (len(goal_routes) >= k
+                and open_heap[0][0] > goal_routes[k - 1][0]):
+            # The k cheapest goal routes are settled: every live or
+            # undiscovered route costs strictly more than the k-th one.
+            break
+        _, _, x, y, t, g, path, seen = heapq.heappop(open_heap)
+        closed_count += 1  # every popped route candidate closes once
+        if (x, y) == goal:
+            goal_routes.append((g, path))
+            continue  # routes end at the goal; never expanded past it
+        next_t = t + 1 if dynamic else 0
+        frame = frame_cells(next_t) if dynamic else frozenset()
+        for dx, dy in _NEIGHBORS:
+            nx, ny = x + dx, y + dy
+            if not (0 <= nx < width and 0 <= ny < height):
+                continue
+            nxt = (nx, ny)
+            if nxt in obstacles or nxt in frame or nxt in seen:
+                continue  # static obstacle, timed obstacle, or revisit
+            new_g = g + step_cost(nxt)
+            new_path = path + (nxt,)
+            h = heuristic(nxt)
+            heapq.heappush(
+                open_heap,
+                (new_g + h, h, nx, ny, next_t, new_g, new_path,
+                 seen | {nxt}),
+            )
+    # Rank by total cost, then the complete coordinate sequence
+    # lexicographically, and keep at most k unique routes.
+    goal_routes.sort(key=lambda item: (item[0], item[1]))
+    top = goal_routes[:k]
+    return {
+        "paths": [list(path) for _, path in top],
+        "costs": [g for g, _ in top],
+        "expanded": closed_count,
+    }
 
 
 def _snapshot_checkpoint(planner, width, height, obstacles, start, endpoints,
@@ -1662,6 +1793,35 @@ def plan_any(width, height, blocked, start, goals, costs=None, trace=False,
     return _search_any(
         width, height, obstacles, frames, start, goal_points, costs, trace,
         max_expanded, max_cost, snapshot
+    )
+
+
+def plan_k(width, height, blocked, start, goal, k, costs=None,
+           dynamic_blocked=None):
+    # --- Validation: exactly ``plan``'s shared checks (dimensions,     ---
+    # --- coordinates, static obstacles, costs, dynamic frames and the ---
+    # --- frame-0 rule) in ``plan``'s order; ``k`` is checked after    ---
+    # --- all of them, before the search starts.                       ---
+    width = _validate_dimension(width, "width")
+    height = _validate_dimension(height, "height")
+    start = _normalize_point(start, "start")
+    goal = _normalize_point(goal, "goal")
+    _check_bounds(start, width, height, "start")
+    _check_bounds(goal, width, height, "goal")
+    obstacles = _normalize_blocked(blocked, width, height)
+    if start in obstacles:
+        raise ValueError(f"start {start} lies on a blocked cell")
+    if goal in obstacles:
+        raise ValueError(f"goal {goal} lies on a blocked cell")
+    costs = _normalize_costs(costs, width, height)
+    frames = _normalize_dynamic_blocked(dynamic_blocked, width, height)
+    if frames is not None and start in frames[0]:
+        raise ValueError(
+            f"start {start} is blocked at frame 0"
+        )
+    _validate_k(k)
+    return _search_k(
+        width, height, obstacles, frames, start, goal, costs, k
     )
 
 

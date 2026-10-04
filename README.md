@@ -72,6 +72,11 @@ Tests: python3 -m unittest discover -s tests -v
 - `path` 必须是非空坐标序列：字符串、字节串、`None` 或其他非序列抛出 `TypeError`；空序列抛出 `TypeError`；元素不是恰好两个整数（含长度不为二、非整数、布尔坐标）抛出 `TypeError`；坐标越界抛出 `ValueError`。
 - 仅语义上无效（结构合法但不满足上述合规条件）的路径不抛异常，返回固定的无效结构。
 
+**距离场（`distance_field`）**
+- `distance_field(width, height, blocked, goal, costs=None, trace=False)` 是面向静态栅格的离线分析入口：从 `goal` 向外做 Dijkstra 遍历，计算每个格子沿四邻域到达 `goal` 的最小进入格子代价总和。它不接受 `start`、`dynamic_blocked`、`max_expanded`、`snapshot` 或 `max_cost` 参数；尺寸、`goal`、`blocked`、`costs` 与 `trace` 沿用 `plan` 的公开校验（`goal` 越界或落在障碍上抛 `ValueError`，`trace` 非布尔抛 `TypeError`），全部校验在搜索开始前完成。
+- 返回 `{"distances": [...], "expanded": int}`。`distances` 按 `distances[y][x]` 索引，尺寸恒等于网格：障碍物与不可达格子为 `None`，`goal` 恒为 0，其余可达格子为从该格出发到达 `goal` 的最小代价（未提供 `costs` 时每步为 1；提供时沿用 `costs[y][x]` 的进入格子语义，因此可达的 `plan` 起点处的值与 `plan` 返回的 `cost` 相同）。任何可达格子的距离都不为负，结果可直接 JSON 序列化。
+- 关闭顺序先按当前最小距离、再按 `(x, y)` 字典序；`expanded` 只统计被确定并关闭一次的可达格子（`goal` 计入）。`trace=True` 时额外返回 `expanded_nodes`（按关闭顺序的坐标二元组，恒有 `expanded == len(expanded_nodes)`）；`trace=False` 或省略时不含该字段。障碍集合与 `costs` 的输入顺序不影响矩阵、统计或轨迹。
+
 **plan 输入校验（搜索开始前完成）** —— replay 的网格参数沿用同一套校验：
 - `width`、`height` 必须为正整数。
 - `start`、`goal` 及 `blocked` 中每个元素必须是两个整数构成的坐标（元组或长度为二的列表等序列，统一规范化为元组）。

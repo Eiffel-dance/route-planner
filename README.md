@@ -34,6 +34,14 @@ Tests: python3 -m unittest discover -s tests -v
 - 搜索保留四邻域移动、禁止等待和回访、进入格子的代价累计。总 `cost` 最小者优先；同价时先比较终点坐标 `(x, y)` 字典序，再比较完整路径字典序。与动态 `plan` 同理，经不同历史到达同一格子的路线是不同状态、互不剪枝；`trace` 在静态模式记录坐标二元组、动态模式记录 `(x, y, t)` 三元组，且只记录实际关闭的节点。
 - 没有任何可行终点时 `path`/`cost` 为 `None`；提供预算时按既有规则返回 `status` 为 `found`、`unreachable` 或 `budget_exhausted`，提供 `max_cost` 时同样始终携带 `status`（规则与 `plan` 一致，含 `cost_exhausted`），预算或上限不会把已确定的较优路线替换成严格次优（更贵）的路线。`goals` 含 `start` 时按既有 `start == goal` 单点零代价规则处理（零预算同样为 `budget_exhausted`）。
 
+`plan_k(width, height, blocked, start, goal, k, costs=None, dynamic_blocked=None)` 在一次请求中返回同一栅格上按优先级排列的前 `k` 条候选路线，供离线比较多条可行方案。
+
+**前 k 条路线（`k`）**
+- 先沿用 `plan` 对尺寸、坐标、静态障碍、正整数代价矩阵与动态帧的类型及取值校验（含第 0 帧 `start` 检查），这些共享检查全部完成后再检查 `k`：`k` 必须是非布尔正整数，类型错误抛 `TypeError`，非正值（0 或负数）抛 `ValueError`；所有错误在搜索开始前确定。`plan_k` 不接受 `trace`、`max_expanded`、`snapshot`、`max_cost` 参数。
+- 搜索仍只允许四邻域移动，起点代价为零，进入格子的代价按 `costs` 累加（未提供时每步为 1），路径不得越过静态障碍或路径下标对应时间帧的动态障碍（超过末帧持续使用末帧），也不得重复坐标或原地等待。经不同完整坐标历史到达同一位置的候选是不同状态、不提前合并，因此不同完整坐标序列始终是不同候选，静态与动态模式一致。
+- 返回对象固定包含 `paths`、`costs`、`expanded`：`paths` 为最多 `k` 条唯一完整路线，按总代价升序、同价按完整坐标序列字典序排列；`costs` 与 `paths` 逐项对应，且首条路线即 `plan` 返回的路线。没有可行路线时两个数组均为空，`expanded` 仍报告为确定结果而实际关闭的候选状态数：每个完整历史只计一次，被过滤（越界、静态/动态障碍、回访）或仍未关闭的候选不计入；第 `k` 条目标路线一关闭即停止，因此较小的 `k` 比较大的 `k` 关闭更少候选。`start == goal` 时只返回单点零代价路线并统计一次扩展。
+- 无论静态还是动态结果，每条路线都可逐条交给 `replay`（以路线末点作为 `goal`）并得到相同代价和步数（`steps == len(path) - 1`）。结果不依赖障碍集合、目标参数、代价矩阵行序或动态帧/帧内坐标的输入顺序。
+
 `replay(width, height, blocked, start, goal, path, costs=None, dynamic_blocked=None, diagnose=False)` 用于离线核验一条已保存的候选路径并重新计算代价；它不执行搜索，返回值不含 `expanded` 或 `expanded_nodes` 字段，且不接受 `trace` 参数。
 
 **快照与恢复（`snapshot` 与 `resume`）**

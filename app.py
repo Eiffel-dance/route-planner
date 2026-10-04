@@ -8,8 +8,9 @@ snapshot=False, max_cost=None)``,
 ``plan_k(width, height, blocked, start, goal, k, costs=None,
 dynamic_blocked=None)``,
 ``replay(width, height, blocked, start, goal, path, costs=None,
-dynamic_blocked=None, diagnose=False)`` and
-``resume(checkpoint, max_expanded=None)``.
+dynamic_blocked=None, diagnose=False)``,
+``resume(checkpoint, max_expanded=None)`` and
+``distance_field(width, height, blocked, goal, costs=None, trace=False)``.
 
 Semantics:
 - Four-neighborhood moves, Manhattan heuristic. Without ``costs`` each step
@@ -279,6 +280,36 @@ Offline replay (``replay``):
   ties resolve to the earliest rule in this list and no partial cost is
   ever returned.
 
+Distance field (``distance_field``):
+- ``distance_field(width, height, blocked, goal, costs=None,
+  trace=False)`` is an offline analysis entry point for the static grid:
+  it accepts only the dimensions, the static obstacles, a single goal and
+  optionally ``costs`` and ``trace`` -- no start, no dynamic obstacles, no
+  search budget, no cost limit and no snapshot option. The dimensions,
+  goal coordinate, obstacle and costs checks (structure, integer types,
+  bounds, duplicate merging, goal-on-obstacle) follow ``plan``'s public
+  rules and order for those shared arguments and all run before the
+  search starts; ``trace`` must be a bool (``TypeError`` otherwise).
+- It returns ``{"distances": ..., "expanded": int}`` where ``distances``
+  is a height-by-width matrix indexed ``distances[y][x]``: ``None`` for
+  obstacles and for cells that cannot reach the goal, ``0`` for the goal
+  itself, and for every other reachable cell the minimum sum of the
+  entering-cell costs along a four-neighborhood route from that cell to
+  the goal (unit steps without ``costs``; with ``costs`` each move adds
+  the cost of the cell entered, exactly as ``plan`` accumulates ``cost``,
+  so a reachable ``plan`` start yields the same value ``plan`` reports
+  as ``cost``). No reachable distance is ever negative and the matrix
+  always matches the grid dimensions; the result is JSON-serializable.
+- ``expanded`` counts exactly the reachable cells determined and closed
+  once each, the goal included. The closing order is fully specified:
+  smallest current distance first, then the ``(x, y)`` coordinate in
+  lexicographic order, so neither the obstacle-set iteration order nor
+  the costs layout traversal influences the matrix, the count or the
+  trace. With ``trace=True`` the result additionally carries
+  ``expanded_nodes``, the coordinate pairs in that closing order, and
+  ``expanded == len(expanded_nodes)``; the field is omitted entirely
+  when ``trace`` is false or omitted.
+
 Validation (all performed before the search starts):
 - ``width``/``height`` must be positive integers.
 - ``start``, ``goal`` and every entry of ``blocked`` must be grid
@@ -297,7 +328,8 @@ Validation (all performed before the search starts):
 import heapq
 from collections.abc import Iterable, Sequence
 
-__all__ = ["plan", "plan_any", "plan_k", "replay", "resume"]
+__all__ = ["plan", "plan_any", "plan_k", "replay", "resume",
+           "distance_field"]
 
 # Fixed neighbor generation order: +x, -x, +y, -y.
 _NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1))
@@ -1009,6 +1041,61 @@ def _search_k(width, height, obstacles, frames, start, goal, costs, k):
                  seen | {nxt}),
             )
     return {"paths": found_paths, "costs": found_costs, "expanded": expanded}
+
+
+def _search_distance_field(width, height, obstacles, goal, costs, trace):
+    """Reverse Dijkstra from the goal over the static grid.
+
+    This is the ``distance_field`` search. Cells are merged by coordinate:
+    the best known distance per cell is kept in ``best``, stale heap
+    entries are skipped, and every reachable cell is closed exactly once
+    (the goal included). Because a move's price is the cost of the cell
+    entered, the distance of a cell is the minimum over its neighbors of
+    ``distance(neighbor) + cost(neighbor)``; expanding a closed cell
+    therefore relaxes each neighbor with the closed cell's own entering
+    cost, and a reachable ``plan`` start yields exactly the cost ``plan``
+    reports. Heap entries are ``(distance, x, y, point)``: the distance
+    and the coordinate give a total, input-order-independent closing
+    order, so the point itself is never compared.
+    """
+
+    def step_cost(point):
+        # Cost of entering ``point``.
+        if costs is None:
+            return 1
+        return costs[point[1]][point[0]]
+
+    distances = [[None] * width for _ in range(height)]
+    open_heap = [(0, goal[0], goal[1], goal)]
+    best = {goal: 0}
+    closed = set()
+    expanded_nodes = [] if trace else None
+
+    while open_heap:
+        dist, x, y, current = heapq.heappop(open_heap)
+        if current in closed:
+            continue  # stale heap entry; already closed with its best dist
+        closed.add(current)
+        distances[y][x] = dist
+        if expanded_nodes is not None:
+            expanded_nodes.append(current)
+        step = step_cost(current)
+        for dx, dy in _NEIGHBORS:
+            nxt = (current[0] + dx, current[1] + dy)
+            if not (0 <= nxt[0] < width and 0 <= nxt[1] < height):
+                continue
+            if nxt in obstacles or nxt in closed:
+                continue
+            new_dist = dist + step
+            if new_dist < best.get(nxt, float("inf")):
+                best[nxt] = new_dist
+                heapq.heappush(
+                    open_heap, (new_dist, nxt[0], nxt[1], nxt)
+                )
+    result = {"distances": distances, "expanded": len(closed)}
+    if trace:
+        result["expanded_nodes"] = expanded_nodes
+    return result
 
 
 def _snapshot_checkpoint(planner, width, height, obstacles, start, endpoints,
@@ -1836,6 +1923,48 @@ def plan_k(width, height, blocked, start, goal, k, costs=None,
         raise ValueError(f"k must be a positive integer, got {k}")
     return _search_k(width, height, obstacles, frames, start, goal,
                      costs, k)
+
+
+def distance_field(width, height, blocked, goal, costs=None, trace=False):
+    """Compute minimum entering-cell distances to ``goal`` for every cell.
+
+    ``distance_field(width, height, blocked, goal, costs=None,
+    trace=False)`` is an offline analysis entry point for the static
+    grid; it accepts no start, dynamic obstacles, budget, cost limit or
+    snapshot option. The dimensions, goal coordinate, static obstacles,
+    cost matrix and trace flag are validated with ``plan``'s public
+    rules for those shared arguments, all before the search starts.
+
+    Returns ``{"distances": ..., "expanded": int}``: ``distances[y][x]``
+    is ``None`` for obstacles and goal-unreachable cells, ``0`` for the
+    goal, and otherwise the minimum sum of the entering-cell costs along
+    a four-neighborhood route from that cell to the goal (unit steps
+    without ``costs``), matching the ``cost`` ``plan`` reports from that
+    cell. ``expanded`` counts the reachable cells closed once each, the
+    goal included; the closing order is smallest current distance first,
+    then the ``(x, y)`` coordinate lexicographically. With
+    ``trace=True`` the result additionally carries ``expanded_nodes``,
+    the coordinate pairs in that closing order, and
+    ``expanded == len(expanded_nodes)``.
+    """
+    # --- Validation: ``plan``'s shared checks for the dimensions, the  ---
+    # --- goal coordinate, the static obstacles, the cost matrix and    ---
+    # --- the trace flag, all decided before the search begins.         ---
+    width = _validate_dimension(width, "width")
+    height = _validate_dimension(height, "height")
+    goal = _normalize_point(goal, "goal")
+    _check_bounds(goal, width, height, "goal")
+    obstacles = _normalize_blocked(blocked, width, height)
+    if goal in obstacles:
+        raise ValueError(f"goal {goal} lies on a blocked cell")
+    costs = _normalize_costs(costs, width, height)
+    if not isinstance(trace, bool):
+        raise TypeError(
+            f"trace must be a bool, got {type(trace).__name__}"
+        )
+    return _search_distance_field(
+        width, height, obstacles, goal, costs, trace
+    )
 
 
 def replay(width, height, blocked, start, goal, path, costs=None,

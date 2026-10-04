@@ -1,11 +1,11 @@
 """Deterministic 2D grid A* planner.
 
 Public entry points: ``plan(width, height, blocked, start, goal, costs=None,
-trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False)``,
-``plan_any(width, height, blocked, start, goals, costs=None, trace=False,
-dynamic_blocked=None, max_expanded=None, snapshot=False)``,
-``replay(width, height, blocked, start, goal, path, costs=None,
-dynamic_blocked=None, diagnose=False)`` and
+trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False,
+max_cost=None)``, ``plan_any(width, height, blocked, start, goals,
+costs=None, trace=False, dynamic_blocked=None, max_expanded=None,
+snapshot=False, max_cost=None)``, ``replay(width, height, blocked, start,
+goal, path, costs=None, dynamic_blocked=None, diagnose=False)`` and
 ``resume(checkpoint, max_expanded=None)``.
 
 Semantics:
@@ -53,6 +53,42 @@ Search budget (``max_expanded``):
   result requires at least one closed node (``max_expanded >= 1``).
 - ``replay`` is unaffected: it keeps validating candidate paths only and
   accepts no budget parameter.
+
+Cost limit (``max_cost``):
+- ``max_cost`` may be omitted or ``None``, which keeps every key, value,
+  exception type and validation order of the default behavior untouched.
+  Otherwise it must be a non-negative integer that is not a bool: other
+  types raise ``TypeError`` and negative values raise ``ValueError``.
+  These checks run after all existing grid, costs, ``trace``,
+  ``dynamic_blocked``, ``max_expanded`` and ``snapshot`` validation and
+  before the search starts.
+- The limit caps the cumulative entering-cell cost measured from the
+  start: the start cell still costs 0 and entering a cell costs its
+  ``costs`` value (1 without ``costs``). A candidate whose cumulative
+  cost exceeds the limit is discarded and never closed. The limit
+  applies identically in static mode, dynamic mode and ``plan_any`` and
+  never changes the dynamic frames, the no-wait/no-revisit rules, the
+  fixed tie-break, the minimum-total-cost choice or the multi-goal
+  endpoint and complete-path lexicographic tie-breaks.
+- When ``max_cost`` is provided the result always carries ``status``:
+  ``"found"`` on success; otherwise ``path``/``cost`` are ``None``,
+  ``expanded`` counts only actually closed nodes, and the status is
+  ``"cost_exhausted"`` when at least one candidate was discarded for
+  exceeding the limit and ``"unreachable"`` when none was. When
+  ``max_expanded`` is also given, a budget stop takes priority and
+  reports ``"budget_exhausted"``. ``trace`` still records only closed
+  nodes. ``start == goal`` still returns the zero-cost single-point
+  path, and the zero-expansion-budget rules keep priority.
+- With ``snapshot=True`` the checkpoint records ``max_cost`` (and
+  whether any candidate has already been discarded for exceeding it)
+  whenever the limit is provided. ``resume`` treats a checkpoint
+  without the field as ``None``; a present field is validated with the
+  same rules (type errors raise ``TypeError``; negative values or a
+  state inconsistent with the limit raise ``ValueError``), all before
+  any searching, and a resumed search matches an uninterrupted call
+  with the same cumulative budget in ``path``, ``cost``, ``status``,
+  ``expanded`` and trace.
+- ``replay`` accepts no ``max_cost`` parameter and is unaffected.
 
 Dynamic obstacles (``dynamic_blocked``):
 - ``dynamic_blocked`` may be omitted, ``None`` or an empty sequence, which
@@ -139,8 +175,9 @@ Snapshots and resumable planning (``snapshot`` and ``resume``):
   carry the field.
 - The checkpoint records the snapshot version, the planner kind, the
   normalized grid constraints (dimensions, obstacles, start, goal or
-  candidate goals, costs and dynamic frames), the closed-node count, the
-  trace recorded so far and the complete pending-candidate state. Every
+  candidate goals, costs and dynamic frames), the cost limit when
+  ``max_cost`` is provided, the closed-node count, the trace recorded
+  so far and the complete pending-candidate state. Every
   set-derived list is stored sorted, so neither obstacle-set iteration
   order, goal order nor in-frame coordinate order influences the
   checkpoint's keys or values. A caller may store it as-is and hand it
@@ -426,8 +463,26 @@ def _validate_snapshot_flag(snapshot):
         )
 
 
+def _validate_max_cost(max_cost):
+    # The shared non-negative-integer cost-limit rules used by ``plan``
+    # and ``plan_any`` (and by ``resume`` for a checkpoint that records
+    # the field): other types raise ``TypeError`` and negative values
+    # raise ``ValueError``.
+    if max_cost is not None:
+        if not _is_int(max_cost):
+            raise TypeError(
+                f"max_cost must be an int, "
+                f"got {type(max_cost).__name__}"
+            )
+        if max_cost < 0:
+            raise ValueError(
+                f"max_cost must be a non-negative integer, "
+                f"got {max_cost}"
+            )
+
+
 def _search_static(width, height, obstacles, start, goal, costs, trace,
-                   max_expanded, snapshot=False, state=None):
+                   max_expanded, snapshot=False, state=None, max_cost=None):
     """Classic static-grid A* (the ``plan`` search without frames).
 
     Cells are merged by coordinate: the best known ``g`` per cell is kept
@@ -437,7 +492,11 @@ def _search_static(width, height, obstacles, start, goal, costs, trace,
     the complete search state; ``state`` carries such a snapshot back in
     so ``resume`` continues the identical traversal. The snapshot needs
     the trace even when the caller did not ask for it, so nodes are
-    recorded whenever ``trace`` or ``snapshot`` is true.
+    recorded whenever ``trace`` or ``snapshot`` is true. With
+    ``max_cost`` a candidate whose cumulative entering cost exceeds the
+    limit is discarded instead of being queued, and ``cost_pruned``
+    records whether that ever happened (it decides the failure status
+    and is part of the checkpointed state).
     """
 
     def heuristic(point):
@@ -459,12 +518,14 @@ def _search_static(width, height, obstacles, start, goal, costs, trace,
         g_score = {start: 0}
         closed = set()
         expanded_nodes = [] if trace or snapshot else None
+        cost_pruned = False
     else:
         open_heap = state["open"]
         came_from = state["came_from"]
         g_score = state["g_score"]
         closed = state["closed"]
         expanded_nodes = state["expanded_nodes"]
+        cost_pruned = state["cost_pruned"]
     budget_stop = False
 
     while open_heap:
@@ -496,7 +557,7 @@ def _search_static(width, height, obstacles, start, goal, costs, trace,
                 "cost": g_score[current],
                 "expanded": len(closed),
             }
-            if max_expanded is not None:
+            if max_expanded is not None or max_cost is not None:
                 result["status"] = "found"
             if trace:
                 result["expanded_nodes"] = expanded_nodes
@@ -509,6 +570,11 @@ def _search_static(width, height, obstacles, start, goal, costs, trace,
                 continue
             new_g = g_score[current] + step_cost(nxt)
             if new_g < g_score.get(nxt, float("inf")):
+                if max_cost is not None and new_g > max_cost:
+                    # Cumulative entering cost over the limit: the
+                    # candidate is discarded without being closed.
+                    cost_pruned = True
+                    continue
                 g_score[nxt] = new_g
                 came_from[nxt] = current
                 h = heuristic(nxt)
@@ -516,10 +582,13 @@ def _search_static(width, height, obstacles, start, goal, costs, trace,
                     open_heap, (new_g + h, h, nxt[0], nxt[1], nxt)
                 )
     result = {"path": None, "cost": None, "expanded": len(closed)}
-    if max_expanded is not None:
-        result["status"] = (
-            "budget_exhausted" if budget_stop else "unreachable"
-        )
+    if max_expanded is not None or max_cost is not None:
+        if budget_stop:
+            result["status"] = "budget_exhausted"
+        elif cost_pruned:
+            result["status"] = "cost_exhausted"
+        else:
+            result["status"] = "unreachable"
     if trace:
         result["expanded_nodes"] = expanded_nodes
     if snapshot and result.get("status") == "budget_exhausted":
@@ -527,12 +596,14 @@ def _search_static(width, height, obstacles, start, goal, costs, trace,
             "plan", width, height, obstacles, start, goal, costs, None,
             len(closed), expanded_nodes,
             _static_snapshot_state(open_heap, came_from, g_score, closed),
+            max_cost, cost_pruned,
         )
     return result
 
 
 def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
-                    trace, max_expanded, snapshot=False, state=None):
+                    trace, max_expanded, snapshot=False, state=None,
+                    max_cost=None):
     """History-sensitive time-expanded A*.
 
     Frame ``t`` constrains the cell occupied at path index ``t``; frames
@@ -549,7 +620,10 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
     the fixed f, h, x, y, t priority and then the complete path's
     lexicographic order. With ``snapshot=True`` a budget stop additionally
     returns a checkpoint of the complete route-tree state; ``state``
-    carries such a snapshot back in for ``resume``.
+    carries such a snapshot back in for ``resume``. With ``max_cost`` a
+    candidate whose cumulative entering cost exceeds the limit is
+    discarded instead of being queued, and ``cost_pruned`` records
+    whether that ever happened.
     """
 
     def heuristic(point):
@@ -589,11 +663,13 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
         # the heap exceeds the best goal cost, no route of that cost (or
         # less) can remain undiscovered.
         best_key = None
+        cost_pruned = False
     else:
         open_heap = state["open"]
         closed_count = state["closed_count"]
         expanded_nodes = state["expanded_nodes"]
         best_key = state["best_key"]
+        cost_pruned = state["cost_pruned"]
     budget_stop = False
 
     while open_heap:
@@ -625,6 +701,11 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
             if nxt in obstacles or nxt in frame or nxt in seen:
                 continue  # static obstacle, timed obstacle, or revisit
             new_g = g + step_cost(nxt)
+            if max_cost is not None and new_g > max_cost:
+                # Cumulative entering cost over the limit: the candidate
+                # is discarded without being closed.
+                cost_pruned = True
+                continue
             new_path = path + (nxt,)
             h = heuristic(nxt)
             heapq.heappush(
@@ -634,10 +715,13 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
             )
     if best_key is None:
         result = {"path": None, "cost": None, "expanded": closed_count}
-        if max_expanded is not None:
-            result["status"] = (
-                "budget_exhausted" if budget_stop else "unreachable"
-            )
+        if max_expanded is not None or max_cost is not None:
+            if budget_stop:
+                result["status"] = "budget_exhausted"
+            elif cost_pruned:
+                result["status"] = "cost_exhausted"
+            else:
+                result["status"] = "unreachable"
     else:
         best_g, _, best_path = best_key
         result = {
@@ -645,7 +729,7 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
             "cost": best_g,
             "expanded": closed_count,
         }
-        if max_expanded is not None:
+        if max_expanded is not None or max_cost is not None:
             result["status"] = "found"
     if trace:
         result["expanded_nodes"] = expanded_nodes
@@ -654,12 +738,14 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
             "plan", width, height, obstacles, start, goal, costs, frames,
             closed_count, expanded_nodes,
             _tree_snapshot_state(open_heap, best_key, "plan"),
+            max_cost, cost_pruned,
         )
     return result
 
 
 def _search_any(width, height, obstacles, frames, start, goals, costs,
-                trace, max_expanded, snapshot=False, state=None):
+                trace, max_expanded, snapshot=False, state=None,
+                max_cost=None):
     """History-sensitive time-expanded A* over several candidate goals.
 
     This is the ``plan_any`` counterpart of ``_search_dynamic``. The only
@@ -675,7 +761,10 @@ def _search_any(width, height, obstacles, frames, start, goals, costs,
     and no timed frames, so the trace records plain coordinate pairs
     there, exactly as ``plan`` does. With ``snapshot=True`` a budget stop
     additionally returns a checkpoint of the complete route-tree state;
-    ``state`` carries such a snapshot back in for ``resume``.
+    ``state`` carries such a snapshot back in for ``resume``. With
+    ``max_cost`` a candidate whose cumulative entering cost exceeds the
+    limit is discarded instead of being queued, and ``cost_pruned``
+    records whether that ever happened.
     """
 
     def heuristic(point):
@@ -721,11 +810,13 @@ def _search_any(width, height, obstacles, frames, start, goals, costs,
         # smallest f on the heap exceeds the best goal cost, no route of
         # that cost (or less) can remain undiscovered.
         best_key = None
+        cost_pruned = False
     else:
         open_heap = state["open"]
         closed_count = state["closed_count"]
         expanded_nodes = state["expanded_nodes"]
         best_key = state["best_key"]
+        cost_pruned = state["cost_pruned"]
     budget_stop = False
 
     while open_heap:
@@ -759,6 +850,11 @@ def _search_any(width, height, obstacles, frames, start, goals, costs,
             if nxt in obstacles or nxt in frame or nxt in seen:
                 continue  # static obstacle, timed obstacle, or revisit
             new_g = g + step_cost(nxt)
+            if max_cost is not None and new_g > max_cost:
+                # Cumulative entering cost over the limit: the candidate
+                # is discarded without being closed.
+                cost_pruned = True
+                continue
             new_path = path + (nxt,)
             h = heuristic(nxt)
             heapq.heappush(
@@ -768,10 +864,13 @@ def _search_any(width, height, obstacles, frames, start, goals, costs,
             )
     if best_key is None:
         result = {"path": None, "cost": None, "expanded": closed_count}
-        if max_expanded is not None:
-            result["status"] = (
-                "budget_exhausted" if budget_stop else "unreachable"
-            )
+        if max_expanded is not None or max_cost is not None:
+            if budget_stop:
+                result["status"] = "budget_exhausted"
+            elif cost_pruned:
+                result["status"] = "cost_exhausted"
+            else:
+                result["status"] = "unreachable"
     else:
         best_g, _, best_path = best_key
         result = {
@@ -779,7 +878,7 @@ def _search_any(width, height, obstacles, frames, start, goals, costs,
             "cost": best_g,
             "expanded": closed_count,
         }
-        if max_expanded is not None:
+        if max_expanded is not None or max_cost is not None:
             result["status"] = "found"
     if trace:
         result["expanded_nodes"] = expanded_nodes
@@ -788,12 +887,14 @@ def _search_any(width, height, obstacles, frames, start, goals, costs,
             "plan_any", width, height, obstacles, start, goals, costs,
             frames, closed_count, expanded_nodes,
             _tree_snapshot_state(open_heap, best_key, "plan_any"),
+            max_cost, cost_pruned,
         )
     return result
 
 
 def _snapshot_checkpoint(planner, width, height, obstacles, start, endpoints,
-                         costs, frames, closed_count, expanded_nodes, state):
+                         costs, frames, closed_count, expanded_nodes, state,
+                         max_cost=None, cost_pruned=False):
     # The checkpoint is built from JSON-native values only (ints, strings,
     # lists, dicts, ``None``) in one fixed key order, and every list
     # derived from a set is sorted, so neither set iteration order, goal
@@ -818,6 +919,14 @@ def _snapshot_checkpoint(planner, width, height, obstacles, start, endpoints,
          for frame in frames]
         if frames is not None else None
     )
+    if max_cost is not None:
+        # The cost limit and whether any candidate has already been
+        # discarded for exceeding it; both are needed for a resumed
+        # search to reproduce the uninterrupted failure status. The
+        # keys are omitted entirely when no limit is in effect, so
+        # checkpoints of pre-max_cost calls keep their exact shape.
+        checkpoint["max_cost"] = max_cost
+        checkpoint["cost_pruned"] = cost_pruned
     checkpoint["closed"] = closed_count
     checkpoint["trace"] = [list(entry) for entry in expanded_nodes]
     checkpoint["state"] = state
@@ -947,7 +1056,7 @@ def _restore_trace(raw, dynamic, unique, width, height, obstacles, frames):
 
 
 def _restore_static_state(raw, width, height, obstacles, start, goal,
-                          trace):
+                          trace, max_cost=None):
     # Rebuild and fully cross-check the static-A* snapshot state.
     if not isinstance(raw, dict):
         raise TypeError(
@@ -1041,6 +1150,12 @@ def _restore_static_state(raw, width, height, obstacles, start, goal,
             raise ValueError(
                 "checkpoint state g_score holds a non-positive cost"
             )
+    if max_cost is not None:
+        for point, g in g_score.items():
+            if g > max_cost:
+                raise ValueError(
+                    "checkpoint state cost exceeds its max_cost"
+                )
     came_from = {}
     for point, parent in came_pairs:
         _check_bounds(point, width, height, "checkpoint state came_from")
@@ -1122,7 +1237,7 @@ def _restore_static_state(raw, width, height, obstacles, start, goal,
 
 def _restore_tree_state(raw, planner, dynamic, width, height, obstacles,
                         frames, start, goal, goals, costs, closed_count,
-                        trace):
+                        trace, max_cost=None):
     # Rebuild and fully cross-check a route-tree snapshot state (dynamic
     # ``plan``, and ``plan_any`` in both static and dynamic mode).
     if not isinstance(raw, dict):
@@ -1257,9 +1372,17 @@ def _restore_tree_state(raw, planner, dynamic, width, height, obstacles,
             raise ValueError(
                 "checkpoint candidate priority is inconsistent"
             )
+        if max_cost is not None and g > max_cost:
+            raise ValueError(
+                "checkpoint candidate cost exceeds its max_cost"
+            )
     if best is not None:
         best_g, best_tie, best_path = best
         check_route(best_path, len(best_path) - 1 if dynamic else 0, best_g)
+        if max_cost is not None and best_g > max_cost:
+            raise ValueError(
+                "checkpoint best route cost exceeds its max_cost"
+            )
         endpoint = best_path[-1]
         if planner == "plan_any":
             if endpoint not in goals:
@@ -1374,6 +1497,23 @@ def _restore_checkpoint(checkpoint):
             f"checkpoint closed must be a non-negative integer, "
             f"got {closed_count}"
         )
+    # The cost limit is optional for backward compatibility: a checkpoint
+    # written before ``max_cost`` existed simply lacks the field and is
+    # treated as unlimited. A present field follows the same rules as
+    # the ``plan`` argument, and a state inconsistent with the limit is
+    # rejected when the state itself is restored below.
+    max_cost = checkpoint.get("max_cost")
+    _validate_max_cost(max_cost)
+    cost_pruned = checkpoint.get("cost_pruned", False)
+    if not isinstance(cost_pruned, bool):
+        raise TypeError(
+            f"checkpoint cost_pruned must be a bool, "
+            f"got {type(cost_pruned).__name__}"
+        )
+    if cost_pruned and max_cost is None:
+        raise ValueError(
+            "checkpoint records cost pruning without a max_cost"
+        )
     dynamic = frames is not None
     # Only the static single-goal search closes each cell at most once;
     # route-tree searches may record the same cell through different
@@ -1395,14 +1535,15 @@ def _restore_checkpoint(checkpoint):
     if planner == "plan" and not dynamic:
         state = _restore_static_state(
             checkpoint["state"], width, height, obstacles, start, goal,
-            trace
+            trace, max_cost
         )
     else:
         state = _restore_tree_state(
             checkpoint["state"], planner, dynamic, width, height,
             obstacles, frames, start, goal, goals, costs, closed_count,
-            trace
+            trace, max_cost
         )
+    state["cost_pruned"] = cost_pruned
     return {
         "planner": planner,
         "width": width,
@@ -1413,12 +1554,14 @@ def _restore_checkpoint(checkpoint):
         "goals": goals,
         "costs": costs,
         "frames": frames,
+        "max_cost": max_cost,
         "state": state,
     }
 
 
 def plan(width, height, blocked, start, goal, costs=None, trace=False,
-         dynamic_blocked=None, max_expanded=None, snapshot=False):
+         dynamic_blocked=None, max_expanded=None, snapshot=False,
+         max_cost=None):
     # --- Validation: everything is checked before the search begins. ---
     width = _validate_dimension(width, "width")
     height = _validate_dimension(height, "height")
@@ -1441,23 +1584,26 @@ def plan(width, height, blocked, start, goal, costs=None, trace=False,
         raise ValueError(
             f"start {start} is blocked at frame 0"
         )
-    # The budget is validated after every pre-existing check, and the new
-    # snapshot flag is validated last of all, before the search starts.
+    # The budget is validated after every pre-existing check, the snapshot
+    # flag follows it, and the cost limit is validated last of all,
+    # before the search starts.
     _validate_budget(max_expanded)
     _validate_snapshot_flag(snapshot)
+    _validate_max_cost(max_cost)
     if frames is not None:
         return _search_dynamic(
             width, height, obstacles, frames, start, goal, costs, trace,
-            max_expanded, snapshot
+            max_expanded, snapshot, max_cost=max_cost
         )
     return _search_static(
         width, height, obstacles, start, goal, costs, trace, max_expanded,
-        snapshot
+        snapshot, max_cost=max_cost
     )
 
 
 def plan_any(width, height, blocked, start, goals, costs=None, trace=False,
-             dynamic_blocked=None, max_expanded=None, snapshot=False):
+             dynamic_blocked=None, max_expanded=None, snapshot=False,
+             max_cost=None):
     # --- Validation: ``goals`` takes ``goal``'s exact position in       ---
     # --- ``plan``'s validation sequence; every shared check keeps its   ---
     # --- order, exception type and message boundary.                    ---
@@ -1485,12 +1631,14 @@ def plan_any(width, height, blocked, start, goals, costs=None, trace=False,
             f"start {start} is blocked at frame 0"
         )
     # The budget stays the last pre-existing check before the search,
-    # exactly as in ``plan``; the new snapshot flag follows it.
+    # exactly as in ``plan``; the snapshot flag and the cost limit
+    # follow it in the same order as ``plan``.
     _validate_budget(max_expanded)
     _validate_snapshot_flag(snapshot)
+    _validate_max_cost(max_cost)
     return _search_any(
         width, height, obstacles, frames, start, goal_points, costs, trace,
-        max_expanded, snapshot
+        max_expanded, snapshot, max_cost=max_cost
     )
 
 
@@ -1590,18 +1738,19 @@ def resume(checkpoint, max_expanded=None):
         return _search_static(
             restored["width"], restored["height"], restored["obstacles"],
             restored["start"], restored["goal"], restored["costs"],
-            True, max_expanded, snapshot=True, state=restored["state"]
+            True, max_expanded, snapshot=True, state=restored["state"],
+            max_cost=restored["max_cost"]
         )
     if restored["planner"] == "plan":
         return _search_dynamic(
             restored["width"], restored["height"], restored["obstacles"],
             restored["frames"], restored["start"], restored["goal"],
             restored["costs"], True, max_expanded, snapshot=True,
-            state=restored["state"]
+            state=restored["state"], max_cost=restored["max_cost"]
         )
     return _search_any(
         restored["width"], restored["height"], restored["obstacles"],
         restored["frames"], restored["start"], restored["goals"],
         restored["costs"], True, max_expanded, snapshot=True,
-        state=restored["state"]
+        state=restored["state"], max_cost=restored["max_cost"]
     )

@@ -96,3 +96,10 @@ Tests: python3 -m unittest discover -s tests -v
 - 返回总代价最小的可行路径；总代价相同时，固定优先级依次为 f、h、x、y、t，仍相同时按完整坐标路径的字典序决定取舍，因此结果不依赖障碍集合、帧内坐标顺序或遍历顺序。
 - 动态模式下 `expanded_nodes` 按实际关闭顺序记录 `(x, y, t)` 三元组，`expanded` 按条目计数；被丢弃的候选不记录。同一 `(x, y, t)` 若由不同历史分别关闭，其三元组按关闭顺序分别出现，`expanded` 逐条计数。不可达时 `path`/`cost` 为 `None`。
 - 校验：外层必须是序列，每一帧必须是可迭代坐标集合；字符串/字节串、非二整数坐标抛出 `TypeError`，越界坐标抛出 `ValueError`，帧内重复坐标合并；`start` 在第 0 帧被禁止时抛出 `ValueError`。所有校验在搜索开始前完成，既有校验顺序不变。
+
+**多终点距离场（`distance_field_any`）**
+
+`distance_field_any(width, height, blocked, goals, costs=None, trace=False)` 是 `distance_field` 的多终点版本：一次离线分析返回到多个候选终点中最近者的最小代价场。
+- `width`、`height`、`blocked`、`costs`、`trace` 沿用 `distance_field` 的公开校验规则与顺序；`goals` 占据单终点在校验序列中的位置：必须是非空序列，`None`、字符串、字节串或其他非序列抛 `TypeError`，空序列抛 `ValueError`；元素不是恰好两个非布尔整数抛 `TypeError`，越界或落在静态障碍上抛 `ValueError`。重复障碍与重复终点均合并，输入排列不影响任何结果；所有检查先于搜索。该入口不接受 `start`、`dynamic_blocked`、`max_expanded`、`max_cost`、`snapshot` 等控制参数，也不生成 `status`。
+- 返回固定包含 `distances`、`targets`、`expanded`；`trace=True` 时额外返回 `expanded_nodes`，`trace=False` 时省略该键。`distances` 为 `height` 行、`width` 列矩阵：障碍及无法到达任何终点的格子为 `None`，终点为 0，其余格子记录沿四邻域到任一终点的最小累计进入格代价（无 `costs` 时每步为 1，有 `costs` 时按 `costs[y][x]` 计，出发格代价不计，语义与 `plan`、`distance_field` 相同）。`targets` 与 `distances` 同形：可达格子记录选中的终点坐标，其余位置为 `None`；等价距离时选择坐标字典序更小的终点。
+- `expanded` 计每个可达格子首次关闭，包含所有终点；关闭顺序按距离再按 `(x, y)` 字典序固定，`expanded_nodes` 记录该顺序且恒有 `expanded == len(expanded_nodes)`。矩阵尺寸、`None` 约定与代价语义稳定，结果可 JSON 序列化并离线保存，不依赖障碍集合、终点列表或代价矩阵的输入顺序。

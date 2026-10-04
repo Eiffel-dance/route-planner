@@ -9,8 +9,11 @@ snapshot=False, max_cost=None)``,
 dynamic_blocked=None)``,
 ``replay(width, height, blocked, start, goal, path, costs=None,
 dynamic_blocked=None, diagnose=False)``,
-``resume(checkpoint, max_expanded=None)`` and
-``distance_field(width, height, blocked, goal, costs=None, trace=False)``.
+``resume(checkpoint, max_expanded=None)``,
+``distance_field(width, height, blocked, goal, costs=None, trace=False)``
+and
+``distance_field_any(width, height, blocked, goals, costs=None,
+trace=False)``.
 
 Semantics:
 - Four-neighborhood moves, Manhattan heuristic. Without ``costs`` each step
@@ -310,11 +313,58 @@ Distance field (``distance_field``):
   ``expanded == len(expanded_nodes)``; the field is omitted entirely
   when ``trace`` is false or omitted.
 
+Multi-goal distance field (``distance_field_any``):
+- ``distance_field_any(width, height, blocked, goals, costs=None,
+  trace=False)`` is the multi-goal counterpart of ``distance_field``:
+  one offline analysis returns the minimum-cost field to any of the
+  candidate endpoints in a single pass. It accepts only the dimensions,
+  the static obstacles, a non-empty ``goals`` sequence and optionally
+  ``costs`` and ``trace`` -- no start, no dynamic obstacles, no search
+  budget, no cost limit and no snapshot option, and it never produces a
+  ``status`` field. The dimensions, obstacles, costs and trace checks
+  follow ``distance_field``'s public rules and order, and ``goals`` is
+  validated exactly like ``plan_any``'s: ``None``, strings, bytes and
+  other non-sequences raise ``TypeError``, an empty sequence raises
+  ``ValueError``, elements that are not exactly two non-bool integers
+  raise ``TypeError``, and out-of-bounds coordinates or endpoints on
+  static obstacles raise ``ValueError``. The goals checks occupy
+  ``goal``'s position in ``distance_field``'s validation sequence,
+  duplicates merge, and every check runs before the search starts, so
+  the input permutation never changes any result.
+- It returns ``{"distances": ..., "targets": ..., "expanded": int}``.
+  ``distances`` is the same height-by-width matrix as
+  ``distance_field``: ``None`` for obstacles and for cells that cannot
+  reach any endpoint, ``0`` for every endpoint, and otherwise the
+  minimum over the endpoints of the accumulated entering-cell cost
+  along a four-neighborhood route (unit steps without ``costs``; with
+  ``costs`` each move adds the cost of the cell entered, the start
+  cell's own cost never counted, exactly as ``plan``/``plan_any`` and
+  ``distance_field`` accumulate). A reachable ``plan_any`` start yields
+  the same value ``plan_any`` reports as ``cost``.
+- ``targets`` is a matrix of the same shape: a reachable cell records
+  the coordinate tuple of the endpoint that wins it, every other
+  position is ``None`` (obstacles and unreachable cells, exactly where
+  ``distances`` is ``None``); endpoints record themselves. When several
+  endpoints tie at the same minimum distance the winner is the endpoint
+  with the lexicographically smallest ``(x, y)`` coordinate, so the
+  choice never depends on goal order. The whole result is
+  JSON-serializable.
+- ``expanded`` counts every reachable cell closed for the first time,
+  all endpoints included, exactly once each. The closing order is
+  smallest distance first, then the ``(x, y)`` coordinate
+  lexicographically. With ``trace=True`` the result additionally
+  carries ``expanded_nodes`` -- the coordinate pairs in that order,
+  ``expanded == len(expanded_nodes)`` -- and the key is omitted
+  entirely when ``trace`` is false or omitted.
+
 Validation (all performed before the search starts):
 - ``width``/``height`` must be positive integers.
 - ``start``, ``goal`` and every entry of ``blocked`` must be grid
   coordinates: sequences of exactly two integers (tuples, lists, etc.),
   normalized to tuples.
+- ``goals`` (``plan_any`` and ``distance_field_any``) must be a
+  non-empty sequence of grid coordinates following the same rules,
+  normalized, deduplicated and order-independent.
 - ``costs`` may be omitted or ``None`` (unit costs). Otherwise it must be a
   sequence of ``height`` rows, each a sequence of ``width`` positive
   integers; strings/bytes, non-integer cells and booleans are rejected.
@@ -329,7 +379,7 @@ import heapq
 from collections.abc import Iterable, Sequence
 
 __all__ = ["plan", "plan_any", "plan_k", "replay", "resume",
-           "distance_field"]
+           "distance_field", "distance_field_any"]
 
 # Fixed neighbor generation order: +x, -x, +y, -y.
 _NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1))
@@ -1093,6 +1143,94 @@ def _search_distance_field(width, height, obstacles, goal, costs, trace):
                     open_heap, (new_dist, nxt[0], nxt[1], nxt)
                 )
     result = {"distances": distances, "expanded": len(closed)}
+    if trace:
+        result["expanded_nodes"] = expanded_nodes
+    return result
+
+
+def _search_distance_field_any(width, height, obstacles, goals, costs,
+                               trace):
+    """Reverse multi-source Dijkstra from all goals over the static grid.
+
+    This is the ``distance_field_any`` search and the multi-goal
+    counterpart of ``_search_distance_field``: every goal is seeded at
+    distance 0 and one pass settles the minimum distance to *any*
+    endpoint. Cells are merged by coordinate: the best known distance
+    per cell is kept in ``best``, stale heap entries are skipped, and
+    every reachable cell is closed exactly once (every goal included).
+    As in the single-goal field, expanding a closed cell relaxes each
+    neighbor with the closed cell's own entering cost, so a reachable
+    ``plan_any`` start yields exactly the cost ``plan_any`` reports. The
+    endpoint that supplies a cell's winning distance is recorded in
+    ``owner`` -- goals own themselves -- and on an exact distance tie
+    the endpoint with the lexicographically smallest coordinate wins,
+    exactly the endpoint tie-break ``plan_any`` uses. Heap entries are
+    ``(distance, x, y, point)``: distance then the coordinate give the
+    total, input-order-independent closing order, and the owner is
+    carried only by the entry's own field and never compared.
+    """
+
+    def step_cost(point):
+        # Cost of entering ``point``.
+        if costs is None:
+            return 1
+        return costs[point[1]][point[0]]
+
+    goal_set = frozenset(goals)
+    distances = [[None] * width for _ in range(height)]
+    targets = [[None] * width for _ in range(height)]
+    # Every goal starts at distance 0 and owns itself. Equal-distance
+    # goals are popped in (x, y) order purely from the heap key, so
+    # seeding order never influences the traversal.
+    open_heap = [(0, goal[0], goal[1], goal) for goal in goals]
+    heapq.heapify(open_heap)
+    best = {goal: 0 for goal in goals}
+    owner = {goal: goal for goal in goals}
+    closed = set()
+    expanded_nodes = [] if trace else None
+
+    while open_heap:
+        dist, x, y, current = heapq.heappop(open_heap)
+        if current in closed:
+            continue  # stale heap entry; already closed with its best dist
+        closed.add(current)
+        current_owner = owner[current]
+        distances[y][x] = dist
+        targets[y][x] = current_owner
+        if expanded_nodes is not None:
+            expanded_nodes.append(current)
+        step = step_cost(current)
+        for dx, dy in _NEIGHBORS:
+            nxt = (current[0] + dx, current[1] + dy)
+            if not (0 <= nxt[0] < width and 0 <= nxt[1] < height):
+                continue
+            if nxt in obstacles or nxt in closed:
+                continue
+            new_dist = dist + step
+            old_dist = best.get(nxt)
+            if old_dist is None:
+                best[nxt] = new_dist
+                owner[nxt] = current_owner
+                heapq.heappush(
+                    open_heap, (new_dist, nxt[0], nxt[1], nxt)
+                )
+            elif new_dist == old_dist:
+                # An equal-distance route from a lexicographically
+                # smaller endpoint wins the cell; the owner only changes
+                # before the cell is closed.
+                if current_owner < owner[nxt]:
+                    owner[nxt] = current_owner
+            elif new_dist < old_dist:
+                best[nxt] = new_dist
+                owner[nxt] = current_owner
+                heapq.heappush(
+                    open_heap, (new_dist, nxt[0], nxt[1], nxt)
+                )
+    result = {
+        "distances": distances,
+        "targets": targets,
+        "expanded": len(closed),
+    }
     if trace:
         result["expanded_nodes"] = expanded_nodes
     return result
@@ -1964,6 +2102,63 @@ def distance_field(width, height, blocked, goal, costs=None, trace=False):
         )
     return _search_distance_field(
         width, height, obstacles, goal, costs, trace
+    )
+
+
+def distance_field_any(width, height, blocked, goals, costs=None,
+                       trace=False):
+    """Compute minimum entering-cell distances to any of several goals.
+
+    ``distance_field_any(width, height, blocked, goals, costs=None,
+    trace=False)`` is the multi-goal counterpart of ``distance_field``
+    and the offline-analysis sibling of ``plan_any``; it accepts no
+    start, dynamic obstacles, budget, cost limit or snapshot option and
+    never produces a ``status`` field. The dimensions, static obstacles,
+    cost matrix and trace flag are validated with ``distance_field``'s
+    public rules, and ``goals`` uses ``plan_any``'s rules in ``goal``'s
+    position in that sequence: a non-empty sequence of grid coordinates,
+    ``None``/strings/bytes/other non-sequences raise ``TypeError``, an
+    empty sequence raises ``ValueError``, elements that are not exactly
+    two non-bool integers raise ``TypeError``, and out-of-bounds or
+    statically blocked endpoints raise ``ValueError``. Duplicates merge
+    and every check runs before the search starts.
+
+    Returns ``{"distances": ..., "targets": ..., "expanded": int}``:
+    ``distances[y][x]`` is ``None`` for obstacles and cells that cannot
+    reach any endpoint, ``0`` for every endpoint, and otherwise the
+    minimum sum of entering-cell costs along a four-neighborhood route
+    to any endpoint (unit steps without ``costs``), matching the
+    ``cost`` ``plan_any`` reports from that cell. ``targets[y][x]``
+    records the winning endpoint coordinate for every reachable cell and
+    is ``None`` elsewhere; on an exact distance tie the endpoint with the
+    lexicographically smallest ``(x, y)`` wins. ``expanded`` counts the
+    reachable cells closed once each, all endpoints included, in the
+    order smallest distance first then ``(x, y)`` lexicographically.
+    With ``trace=True`` the result additionally carries
+    ``expanded_nodes``, the coordinate pairs in that closing order, and
+    ``expanded == len(expanded_nodes)``. The whole result is
+    JSON-serializable.
+    """
+    # --- Validation: ``distance_field``'s shared checks for the         ---
+    # --- dimensions, with ``goals`` taking ``goal``'s position, then    ---
+    # --- the static obstacles, the cost matrix and the trace flag; all  ---
+    # --- decided before the search begins.                              ---
+    width = _validate_dimension(width, "width")
+    height = _validate_dimension(height, "height")
+    goal_points = _normalize_goals(goals)
+    for point in goal_points:
+        _check_bounds(point, width, height, "goal")
+    obstacles = _normalize_blocked(blocked, width, height)
+    for point in goal_points:
+        if point in obstacles:
+            raise ValueError(f"goal {point} lies on a blocked cell")
+    costs = _normalize_costs(costs, width, height)
+    if not isinstance(trace, bool):
+        raise TypeError(
+            f"trace must be a bool, got {type(trace).__name__}"
+        )
+    return _search_distance_field_any(
+        width, height, obstacles, goal_points, costs, trace
     )
 
 

@@ -42,6 +42,20 @@ Tests: python3 -m unittest discover -s tests -v
 - 返回对象固定包含 `paths`、`costs`、`expanded`：`paths` 为最多 `k` 条唯一完整路线，按总代价升序、同价按完整坐标序列字典序排列；`costs` 与 `paths` 逐项对应，且首条路线即 `plan` 返回的路线。没有可行路线时两个数组均为空，`expanded` 仍报告为确定结果而实际关闭的候选状态数：每个完整历史只计一次，被过滤（越界、静态/动态障碍、回访）或仍未关闭的候选不计入；第 `k` 条目标路线一关闭即停止，因此较小的 `k` 比较大的 `k` 关闭更少候选。`start == goal` 时只返回单点零代价路线并统计一次扩展。
 - 无论静态还是动态结果，每条路线都可逐条交给 `replay`（以路线末点作为 `goal`）并得到相同代价和步数（`steps == len(path) - 1`）。结果不依赖障碍集合、目标参数、代价矩阵行序或动态帧/帧内坐标的输入顺序。
 
+`distance_field(width, height, blocked, goal, costs=None, trace=False)` 与 `distance_field_any(width, height, blocked, goals, costs=None, trace=False)` 是面向静态栅格的离线分析入口：一次分析给出到单个或多个候选终点的最低代价场；不接受 `start`、`dynamic_blocked`、`max_expanded`、`max_cost`、`snapshot` 或其他控制参数，也不生成 `status`。
+
+**单终点代价场（`distance_field`）**
+- 尺寸、`goal` 坐标、静态障碍、`costs` 与 `trace` 沿用 `plan` 对这些共享参数的公开校验规则与顺序（结构与整数类型错误抛 `TypeError`，越界、终点落在障碍上、矩阵形状或代价取值错误抛 `ValueError`），重复障碍合并，全部检查先于搜索。
+- 固定返回 `{"distances", "expanded"}`：`distances` 为 `height` 行、`width` 列矩阵（`distances[y][x]`），障碍及无法到达终点的格子为 `None`，终点为 `0`，其余格子为沿四邻域到终点的最小累计进入格代价（无 `costs` 时每步为 1，有 `costs` 时使用 `costs[y][x]`，出发格代价不计），与 `plan` 报告的 `cost` 一致。
+- `expanded` 统计每个可达格子首次关闭一次（含终点）；关闭顺序固定为先距离后 `(x, y)` 字典序。`trace=True` 时额外返回该顺序的 `expanded_nodes` 且 `expanded == len(expanded_nodes)`；`trace=False` 或省略时不含该键。
+
+**多终点代价场（`distance_field_any`）**
+- `width`、`height`、`blocked`、`costs`、`trace` 沿用 `distance_field` 的公开校验规则；`goals` 必须是非空序列，`None`、字符串、字节串或其他非序列抛 `TypeError`，空序列抛 `ValueError`；元素不是恰好两个非布尔整数抛 `TypeError`，越界或落在静态障碍上抛 `ValueError`。`goals` 在校验序列中占据 `goal` 的位置，重复终点合并，输入排列（含障碍与代价行的顺序）不影响任何结果，所有检查先于搜索。
+- 固定返回 `{"distances", "targets", "expanded"}`；`trace=True` 时额外返回 `expanded_nodes`，`trace=False` 或省略时省略该键。
+- `distances` 与 `distance_field` 同形同约定：障碍及无法到达任何终点的格子为 `None`，每个终点为 `0`，其余格子为到任一终点的最小累计进入格代价（单位步长或 `costs[y][x]`，出发格不计），可达格子作为 `plan_any` 的起点时取值与 `plan_any` 的 `cost` 一致。
+- `targets` 与 `distances` 同形：可达格子记录为其提供最小距离的终点坐标，障碍与不可达格子为 `None`，终点记录自身；等价距离时选 `(x, y)` 字典序更小的终点，选择不依赖终点输入顺序。
+- `expanded` 统计每个可达格子首次关闭一次（包含全部终点），关闭顺序固定为先距离后 `(x, y)` 字典序；`expanded_nodes` 按此顺序记录且长度等于 `expanded`。矩阵尺寸、`None` 约定、代价语义、关闭顺序与结果完全确定、可 JSON 序列化并离线保存。
+
 `replay(width, height, blocked, start, goal, path, costs=None, dynamic_blocked=None, diagnose=False)` 用于离线核验一条已保存的候选路径并重新计算代价；它不执行搜索，返回值不含 `expanded` 或 `expanded_nodes` 字段，且不接受 `trace` 参数。
 
 **快照与恢复（`snapshot` 与 `resume`）**

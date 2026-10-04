@@ -268,11 +268,25 @@ class PlanKValidationTest(unittest.TestCase):
             set(plan(3, 3, set(), (0, 0), (2, 2))),
             {"path", "cost", "expanded"},
         )
-        # plan_k accepts no trace/budget/snapshot/max_cost options.
-        for kwargs in ({"trace": True}, {"max_expanded": 1},
-                       {"snapshot": True}, {"max_cost": 1}):
+        # plan_k still accepts no trace/snapshot options, but it does
+        # accept the optional max_expanded/max_cost limits.
+        for kwargs in ({"trace": True}, {"snapshot": True}):
             with self.assertRaises(TypeError, msg=kwargs):
                 plan_k(3, 3, set(), (0, 0), (2, 2), 1, **kwargs)
+        result = plan_k(3, 3, set(), (0, 0), (2, 2), 1,
+                        max_expanded=100, max_cost=100)
+        self.assertEqual(result["status"], "found")
+
+    def test_omitted_limits_keep_legacy_shape(self):
+        for kwargs in ({}, {"max_expanded": None}, {"max_cost": None},
+                       {"max_expanded": None, "max_cost": None}):
+            result = plan_k(3, 3, set(), (0, 0), (2, 2), 6, **kwargs)
+            self.assertEqual(set(result), {"paths", "costs", "expanded"},
+                             kwargs)
+        legacy = plan_k(3, 3, set(), (0, 0), (2, 2), 6)
+        explicit = plan_k(3, 3, set(), (0, 0), (2, 2), 6,
+                          max_expanded=None, max_cost=None)
+        self.assertEqual(explicit, legacy)
 
 
 if __name__ == '__main__':

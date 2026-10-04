@@ -34,13 +34,19 @@ Tests: python3 -m unittest discover -s tests -v
 - 搜索保留四邻域移动、禁止等待和回访、进入格子的代价累计。总 `cost` 最小者优先；同价时先比较终点坐标 `(x, y)` 字典序，再比较完整路径字典序。与动态 `plan` 同理，经不同历史到达同一格子的路线是不同状态、互不剪枝；`trace` 在静态模式记录坐标二元组、动态模式记录 `(x, y, t)` 三元组，且只记录实际关闭的节点。
 - 没有任何可行终点时 `path`/`cost` 为 `None`；提供预算时按既有规则返回 `status` 为 `found`、`unreachable` 或 `budget_exhausted`，提供 `max_cost` 时同样始终携带 `status`（规则与 `plan` 一致，含 `cost_exhausted`），预算或上限不会把已确定的较优路线替换成严格次优（更贵）的路线。`goals` 含 `start` 时按既有 `start == goal` 单点零代价规则处理（零预算同样为 `budget_exhausted`）。
 
-`plan_k(width, height, blocked, start, goal, k, costs=None, dynamic_blocked=None)` 在一次请求中返回同一栅格上按优先级排列的前 `k` 条候选路线，供离线比较多条可行方案。
+`plan_k(width, height, blocked, start, goal, k, costs=None, dynamic_blocked=None, max_expanded=None, max_cost=None)` 在一次请求中返回同一栅格上按优先级排列的前 `k` 条候选路线，供离线比较多条可行方案；可选的 `max_expanded` 与 `max_cost` 在不改变既有顺序与 tie-break 的前提下安全地暂停或限制搜索。
 
 **前 k 条路线（`k`）**
-- 先沿用 `plan` 对尺寸、坐标、静态障碍、正整数代价矩阵与动态帧的类型及取值校验（含第 0 帧 `start` 检查），这些共享检查全部完成后再检查 `k`：`k` 必须是非布尔正整数，类型错误抛 `TypeError`，非正值（0 或负数）抛 `ValueError`；所有错误在搜索开始前确定。`plan_k` 不接受 `trace`、`max_expanded`、`snapshot`、`max_cost` 参数。
+- 先沿用 `plan` 对尺寸、坐标、静态障碍、正整数代价矩阵与动态帧的类型及取值校验（含第 0 帧 `start` 检查），这些共享检查全部完成后再检查 `k`：`k` 必须是非布尔正整数，类型错误抛 `TypeError`，非正值（0 或负数）抛 `ValueError`；`k` 检查之后、搜索开始之前再校验可选的 `max_expanded` 与 `max_cost`，二者分别复用 `plan` 的非负且非布尔整数规则（其他类型抛 `TypeError`，负数抛 `ValueError`）。所有错误在搜索开始前确定。`plan_k` 不接受 `trace`、`snapshot` 参数。
 - 搜索仍只允许四邻域移动，起点代价为零，进入格子的代价按 `costs` 累加（未提供时每步为 1），路径不得越过静态障碍或路径下标对应时间帧的动态障碍（超过末帧持续使用末帧），也不得重复坐标或原地等待。经不同完整坐标历史到达同一位置的候选是不同状态、不提前合并，因此不同完整坐标序列始终是不同候选，静态与动态模式一致。
 - 返回对象固定包含 `paths`、`costs`、`expanded`：`paths` 为最多 `k` 条唯一完整路线，按总代价升序、同价按完整坐标序列字典序排列；`costs` 与 `paths` 逐项对应，且首条路线即 `plan` 返回的路线。没有可行路线时两个数组均为空，`expanded` 仍报告为确定结果而实际关闭的候选状态数：每个完整历史只计一次，被过滤（越界、静态/动态障碍、回访）或仍未关闭的候选不计入；第 `k` 条目标路线一关闭即停止，因此较小的 `k` 比较大的 `k` 关闭更少候选。`start == goal` 时只返回单点零代价路线并统计一次扩展。
 - 无论静态还是动态结果，每条路线都可逐条交给 `replay`（以路线末点作为 `goal`）并得到相同代价和步数（`steps == len(path) - 1`）。结果不依赖障碍集合、目标参数、代价矩阵行序或动态帧/帧内坐标的输入顺序。
+
+**前 k 条路线的搜索限制（`max_expanded` 与 `max_cost`）**
+- 二者省略或为 `None` 时，`plan_k` 的返回键、值、顺序、`expanded` 计数与异常边界与既有行为完全一致。只要任一限制显式提供，结果额外携带 `status`；不提供时不增加该键。
+- `max_cost` 与 `plan` 同一口径地约束从起点累计的进入格子代价：起点仍为 0，恰好等于上限的候选仍参与竞争，累计超过上限的候选在生成时立即丢弃；它不改变合法路径之间的 tie-break，也不会把已确定的较优路线替换成严格更差的路线。
+- `max_expanded` 按实际关闭的完整路径候选计数（即 `expanded` 的口径），达到上限后不得再关闭任何候选；它只能截断搜索，不能替换已经确定的前若干名结果。提前结束时仍返回已关闭的路线与逐项对应的代价并保留排名顺序，一条都没有时使用空列表，`expanded` 为实际关闭数。
+- `status` 取值：凑齐 `k` 条路线，或搜索自然耗尽但至少找到一条路线时为 `"found"`；未凑齐 `k` 且扩展上限截断时仍有待处理候选为 `"budget_exhausted"`；未凑齐 `k`、未发生预算截断且至少一个候选因代价上限被丢弃为 `"cost_exhausted"`；没有任何路线且既无预算截断也无代价丢弃时为 `"unreachable"`。两种截断同时发生时 `"budget_exhausted"` 优先。动态模式继续沿用持久化末帧、禁止等待、禁止回访和可由 `replay` 验证的语义。
 
 `distance_field(width, height, blocked, goal, costs=None, trace=False)` 与 `distance_field_any(width, height, blocked, goals, costs=None, trace=False)` 是面向静态栅格的离线分析入口：一次分析给出到单个或多个候选终点的最低代价场；不接受 `start`、`dynamic_blocked`、`max_expanded`、`max_cost`、`snapshot` 或其他控制参数，也不生成 `status`。
 

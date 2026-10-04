@@ -268,11 +268,16 @@ class PlanKValidationTest(unittest.TestCase):
             set(plan(3, 3, set(), (0, 0), (2, 2))),
             {"path", "cost", "expanded"},
         )
-        # plan_k accepts no trace/budget/snapshot/max_cost options.
-        for kwargs in ({"trace": True}, {"max_expanded": 1},
-                       {"snapshot": True}, {"max_cost": 1}):
+        # plan_k still accepts no trace/snapshot options.
+        for kwargs in ({"trace": True}, {"snapshot": True}):
             with self.assertRaises(TypeError, msg=kwargs):
                 plan_k(3, 3, set(), (0, 0), (2, 2), 1, **kwargs)
+        # Omitting both new limits keeps the legacy key set exactly.
+        legacy = plan_k(3, 3, set(), (0, 0), (2, 2), 3)
+        self.assertEqual(set(legacy), {"paths", "costs", "expanded"})
+        explicit_none = plan_k(3, 3, set(), (0, 0), (2, 2), 3,
+                               max_expanded=None, max_cost=None)
+        self.assertEqual(explicit_none, legacy)
 
 
 if __name__ == '__main__':

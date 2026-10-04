@@ -6,7 +6,7 @@ max_cost=None)``, ``plan_any(width, height, blocked, start, goals,
 costs=None, trace=False, dynamic_blocked=None, max_expanded=None,
 snapshot=False, max_cost=None)``,
 ``plan_k(width, height, blocked, start, goal, k, costs=None,
-dynamic_blocked=None)``,
+dynamic_blocked=None, max_expanded=None, max_cost=None)``,
 ``replay(width, height, blocked, start, goal, path, costs=None,
 dynamic_blocked=None, diagnose=False)``,
 ``resume(checkpoint, max_expanded=None)``,
@@ -167,15 +167,20 @@ Multi-goal planning (``plan_any``):
 
 Top-k planning (``plan_k``):
 - ``plan_k(width, height, blocked, start, goal, k, costs=None,
-  dynamic_blocked=None)`` returns several distinct feasible routes on the
-  same grid in one call. It first performs exactly ``plan``'s shared
-  validation for the dimensions, coordinates, static obstacles, positive
-  integer cost matrix and dynamic frames (including the frame-0 start
-  check), and only then checks ``k``: a non-bool positive integer is
-  required, wrong types raise ``TypeError`` and non-positive values raise
-  ``ValueError``. Every error is decided before the search starts, and
-  ``plan_k`` accepts no ``trace``, ``max_expanded``, ``snapshot`` or
-  ``max_cost`` arguments.
+  dynamic_blocked=None, max_expanded=None, max_cost=None)`` returns
+  several distinct feasible routes on the same grid in one call. It
+  first performs exactly ``plan``'s shared validation for the
+  dimensions, coordinates, static obstacles, positive integer cost
+  matrix and dynamic frames (including the frame-0 start check), and
+  only then checks ``k``: a non-bool positive integer is required,
+  wrong types raise ``TypeError`` and non-positive values raise
+  ``ValueError``. The optional ``max_expanded`` and ``max_cost``
+  limits are checked after all of that (the ``k`` check included),
+  still before the search starts, with the same non-negative,
+  non-bool integer rules ``plan`` uses (other types raise
+  ``TypeError``, negative values raise ``ValueError``). Every error is
+  decided before the search starts, and ``plan_k`` accepts no
+  ``trace`` or ``snapshot`` argument.
 - The search keeps four-neighborhood moves, the zero start cost, the
   entering-cell cost accumulation, the persistent last frame, the ban on
   waiting in place and on repeated coordinates, and the static/frame
@@ -198,6 +203,28 @@ Top-k planning (``plan_k``):
   verifies offline in ``replay`` with the same cost and step count, in
   both static and dynamic mode; the result never depends on obstacle-set
   iteration order, in-frame coordinate order or the traversal order.
+- ``max_cost`` caps a route's accumulated entering-cell cost exactly as
+  in ``plan``: the start still costs 0, a candidate exactly at the
+  limit still competes and a candidate whose accumulated cost would
+  exceed it is discarded the moment it is generated. It never changes
+  the tie-break between legal routes. ``max_expanded`` caps the number
+  of complete route candidates actually closed (exactly what
+  ``expanded`` counts); once the limit is reached no further candidate
+  is closed, and the limit only ever truncates the traversal -- it can
+  never replace an already determined higher-ranked route. When either
+  limit is provided the result additionally carries ``status``:
+  ``"found"`` when all ``k`` routes were closed or the search exhausted
+  naturally with at least one route; ``"budget_exhausted"`` when fewer
+  than ``k`` routes were found and the budget stopped the search while
+  candidates were still pending (this wins when both limits fire);
+  ``"cost_exhausted"`` when fewer than ``k`` routes were found, no
+  budget stop occurred and at least one candidate was discarded for the
+  cost limit; ``"unreachable"`` when no route exists with neither a
+  budget stop nor a cost discard. The routes already closed (and their
+  costs, in rank order) are still returned when a limit ends the search
+  early, as empty lists when none were found, and ``expanded`` is the
+  actual closed count. Omitting both limits keeps every legacy key and
+  value exactly unchanged.
 
 Snapshots and resumable planning (``snapshot`` and ``resume``):
 - ``plan`` and ``plan_any`` accept a final ``snapshot=False`` option.
@@ -1009,7 +1036,8 @@ def _search_any(width, height, obstacles, frames, start, goals, costs,
     return result
 
 
-def _search_k(width, height, obstacles, frames, start, goal, costs, k):
+def _search_k(width, height, obstacles, frames, start, goal, costs, k,
+              max_expanded=None, max_cost=None):
     """Best-first traversal of the feasible route tree keeping the k best.
 
     This is the ``plan_k`` search. As in ``_search_dynamic`` and
@@ -1033,6 +1061,21 @@ def _search_k(width, height, obstacles, frames, start, goal, costs, k):
     equal-or-larger rank. ``expanded`` counts only the route candidates
     actually popped and closed, once per complete history; candidates
     filtered at generation and candidates left pending are never counted.
+
+    Optional limits: ``max_cost`` discards at generation time every
+    candidate whose accumulated entering-cell cost would exceed it (a
+    candidate exactly at the limit still competes; the start costs 0 and
+    is never checked), remembering whether any discard happened so a
+    short result can be reported as ``cost_exhausted``. ``max_expanded``
+    caps the number of route candidates closed: once the count reaches
+    the limit the loop stops with live candidates still pending, which a
+    short result reports as ``budget_exhausted`` (a budget stop wins over
+    a cost-limit stop). Neither limit ever changes the ordering or the
+    routes already determined: a candidate is only dropped or left
+    pending, so the returned prefix is exactly the corresponding prefix
+    of the unlimited result. When either limit is given the result
+    carries ``status``; without them the shape is exactly the legacy
+    ``{"paths", "costs", "expanded"}``.
     """
 
     def heuristic(point):
@@ -1061,8 +1104,17 @@ def _search_k(width, height, obstacles, frames, start, goal, costs, k):
     expanded = 0
     found_paths = []
     found_costs = []
+    cost_limited = False  # any candidate discarded for exceeding max_cost
+    budget_stop = False
+    has_status = max_expanded is not None or max_cost is not None
 
     while open_heap and len(found_paths) < k:
+        if max_expanded is not None and expanded >= max_expanded:
+            # Live route candidates remain but the close budget is spent;
+            # close nothing more. Any goal routes already closed keep
+            # their rank below.
+            budget_stop = True
+            break
         _, path, x, y, t, g, seen = heapq.heappop(open_heap)
         expanded += 1  # every popped route candidate closes exactly once
         cell = (x, y)
@@ -1083,6 +1135,13 @@ def _search_k(width, height, obstacles, frames, start, goal, costs, k):
             if nxt in obstacles or nxt in frame or nxt in seen:
                 continue  # static obstacle, timed obstacle, or revisit
             new_g = g + step_cost(nxt)
+            if max_cost is not None and new_g > max_cost:
+                # The candidate's accumulated cost exceeds the limit:
+                # discard it the moment it is generated and remember
+                # that a discard happened. The start (g == 0) is never
+                # generated here and so is never affected.
+                cost_limited = True
+                continue
             new_path = path + (nxt,)
             h = heuristic(nxt)
             heapq.heappush(
@@ -1090,7 +1149,26 @@ def _search_k(width, height, obstacles, frames, start, goal, costs, k):
                 (new_g + h, new_path, nx, ny, next_t, new_g,
                  seen | {nxt}),
             )
-    return {"paths": found_paths, "costs": found_costs, "expanded": expanded}
+    result = {"paths": found_paths, "costs": found_costs, "expanded": expanded}
+    if has_status:
+        if len(found_paths) >= k:
+            result["status"] = "found"
+        elif budget_stop:
+            # The budget cut the search short with candidates still
+            # pending; this takes priority over the cost-limit status.
+            result["status"] = "budget_exhausted"
+        elif found_paths:
+            # The heap drained naturally (no budget truncation) and at
+            # least one ranked route was closed, just fewer than k.
+            result["status"] = "found"
+        elif cost_limited:
+            # No route was found, but at least one candidate had to be
+            # dropped for exceeding the cost limit while no budget cut
+            # the traversal short.
+            result["status"] = "cost_exhausted"
+        else:
+            result["status"] = "unreachable"
+    return result
 
 
 def _search_distance_field(width, height, obstacles, goal, costs, trace):
@@ -2011,19 +2089,24 @@ def plan_any(width, height, blocked, start, goals, costs=None, trace=False,
 
 
 def plan_k(width, height, blocked, start, goal, k, costs=None,
-           dynamic_blocked=None):
+           dynamic_blocked=None, max_expanded=None, max_cost=None):
     """Return up to ``k`` distinct routes ordered by priority.
 
     ``plan_k(width, height, blocked, start, goal, k, costs=None,
-    dynamic_blocked=None)`` runs the same grid/obstacle/costs/frame
-    validation as ``plan`` first and then checks ``k``: it must be a
-    positive, non-bool integer (wrong types raise ``TypeError`` and
-    non-positive values raise ``ValueError``), and every error is decided
-    before the search starts. The search keeps four-neighborhood moves,
-    zero start cost, entering-cell cost accumulation, the persistent last
-    frame, no waiting and no repeated coordinates; routes reaching the
-    same cell through different coordinate histories are distinct
-    candidates and are never merged.
+    dynamic_blocked=None, max_expanded=None, max_cost=None)`` runs the
+    same grid/obstacle/costs/frame validation as ``plan`` first and then
+    checks ``k``: it must be a positive, non-bool integer (wrong types
+    raise ``TypeError`` and non-positive values raise ``ValueError``).
+    The optional ``max_expanded`` and ``max_cost`` limits are validated
+    after all of those checks (and after the ``k`` check), still before
+    the search starts: each must be a non-negative, non-bool integer
+    (other types raise ``TypeError`` and negative values raise
+    ``ValueError``), reusing ``plan``'s budget and cost-limit rules.
+    Every error is decided before the search starts. The search keeps
+    four-neighborhood moves, zero start cost, entering-cell cost
+    accumulation, the persistent last frame, no waiting and no repeated
+    coordinates; routes reaching the same cell through different
+    coordinate histories are distinct candidates and are never merged.
 
     Returns ``{"paths": [...], "costs": [...], "expanded": int}`` with the
     at most ``k`` unique complete routes ordered by ascending total cost
@@ -2036,10 +2119,25 @@ def plan_k(width, height, blocked, start, goal, k, costs=None,
     route alone, with one expansion. Every returned route verifies in
     ``replay`` with the same cost and step count, in both static and
     dynamic mode.
+
+    When either ``max_expanded`` or ``max_cost`` is provided (not
+    omitted/``None``) the result additionally carries ``status``:
+    ``"found"`` when all ``k`` routes were closed or the search exhausted
+    naturally with at least one route; ``"budget_exhausted"`` when fewer
+    than ``k`` routes were found and the close budget stopped the search
+    while candidates remained pending; ``"cost_exhausted"`` when fewer
+    than ``k`` routes were found, no budget stop occurred and at least one
+    candidate was discarded for exceeding the cost limit; and
+    ``"unreachable"`` when no route exists with neither stop nor discard.
+    A budget stop wins over a cost-limit stop. The already closed routes
+    (and their costs, in rank order) are always returned even when a
+    limit cuts the search short, and empty lists are used when none were
+    found; ``expanded`` is always the actual closed-candidate count.
+    Omitting both limits keeps the exact legacy result keys and values.
     """
-    # --- Validation: exactly ``plan``'s shared checks first (the      ---
-    # --- trace/budget/snapshot/max_cost options do not exist here),    ---
-    # --- then the ``k`` check, all before the search begins.          ---
+    # --- Validation: exactly ``plan``'s shared checks first, then the  ---
+    # --- ``k`` check, then the optional limits, all before the search  ---
+    # --- begins.                                                       ---
     width = _validate_dimension(width, "width")
     height = _validate_dimension(height, "height")
     start = _normalize_point(start, "start")
@@ -2059,8 +2157,12 @@ def plan_k(width, height, blocked, start, goal, k, costs=None,
         raise TypeError(f"k must be an int, got {type(k).__name__}")
     if k <= 0:
         raise ValueError(f"k must be a positive integer, got {k}")
+    # The optional limits follow every pre-existing check (k included),
+    # reusing the shared non-negative-integer rules, before the search.
+    _validate_budget(max_expanded)
+    _validate_max_cost(max_cost)
     return _search_k(width, height, obstacles, frames, start, goal,
-                     costs, k)
+                     costs, k, max_expanded, max_cost)
 
 
 def distance_field(width, height, blocked, goal, costs=None, trace=False):

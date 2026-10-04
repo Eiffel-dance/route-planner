@@ -1,7 +1,9 @@
 """Deterministic 2D grid A* planner.
 
 Public entry points: ``plan(width, height, blocked, start, goal, costs=None,
-trace=False, dynamic_blocked=None, max_expanded=None)`` and
+trace=False, dynamic_blocked=None, max_expanded=None)``,
+``plan_any(width, height, blocked, start, goals, costs=None, trace=False,
+dynamic_blocked=None, max_expanded=None)`` and
 ``replay(width, height, blocked, start, goal, path, costs=None,
 dynamic_blocked=None, diagnose=False)``.
 
@@ -82,6 +84,40 @@ Dynamic obstacles (``dynamic_blocked``):
   duplicates within a frame are merged, and a ``start`` blocked at frame 0
   raises ``ValueError``. All checks run before the search starts.
 
+Multi-goal planning (``plan_any``):
+- ``plan_any`` accepts exactly the same arguments as ``plan`` except that
+  the single ``goal`` is replaced by ``goals``, a non-empty sequence of
+  candidate goal coordinates, and returns one deterministic minimum-cost
+  route to one of them. The result has the same shape as ``plan``'s
+  (including ``status`` when a budget is given and ``expanded_nodes``
+  when ``trace`` is true), ``path`` ends at the selected candidate, and
+  it can be re-checked offline by ``replay`` with that endpoint as
+  ``goal``.
+- ``goals`` must be a sequence: strings, bytes, ``None`` and other
+  non-sequences raise ``TypeError`` and an empty sequence raises
+  ``ValueError``. Each entry follows the same coordinate rules as
+  ``goal``: malformed shapes or non-integer coordinates raise
+  ``TypeError``; out-of-bounds coordinates or candidates on static
+  obstacles raise ``ValueError``. Duplicate candidates are merged and
+  the order of ``goals`` never affects any result. The grid, ``costs``,
+  ``trace``, ``dynamic_blocked`` and budget checks keep exactly the
+  ``plan`` validation order and exception types, and ``start`` must
+  still pass the static-obstacle and frame-0 checks. A candidate lying
+  on a dynamic frame is not an input error: a route that would arrive
+  there while the frame blocks it is simply infeasible at that arrival
+  time, and other arrival times still compete.
+- The search keeps the four-neighborhood moves, the no-wait/no-revisit
+  rule, the last-frame persistence and the entering-cell cost
+  accumulation. The winning route has the lowest total cost; ties are
+  settled first by the goal ``(x, y)`` coordinate in lexicographic
+  order, then by the complete path in lexicographic order. Expansion
+  order and traces never depend on the iteration order of ``goals``,
+  ``blocked`` or the dynamic frames, and a budget never replaces an
+  already-determined better route with a worse one. When no candidate
+  is feasible ``path``/``cost`` are ``None``. If ``goals`` contains
+  ``start`` the single-point zero-cost route follows the usual
+  ``start == goal`` rules (including the zero-budget behavior).
+
 Offline replay (``replay``):
 - ``replay`` re-checks a saved candidate path without running any search;
   it never returns ``expanded`` or ``expanded_nodes``. It accepts the same
@@ -140,7 +176,7 @@ Validation (all performed before the search starts):
 import heapq
 from collections.abc import Iterable, Sequence
 
-__all__ = ["plan", "replay"]
+__all__ = ["plan", "plan_any", "replay"]
 
 # Fixed neighbor generation order: +x, -x, +y, -y.
 _NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1))
@@ -267,6 +303,20 @@ def _normalize_dynamic_blocked(dynamic_blocked, width, height):
             cells.add(point)  # duplicates merge into one cell
         frames.append(frozenset(cells))
     return frames
+
+
+def _normalize_goals(goals):
+    if isinstance(goals, (str, bytes)) or not isinstance(goals, Sequence):
+        raise TypeError(
+            f"goals must be a non-empty sequence of grid coordinates, "
+            f"got {type(goals).__name__}"
+        )
+    if len(goals) == 0:
+        raise ValueError("goals must be a non-empty sequence of coordinates")
+    points = []
+    for index, item in enumerate(goals):
+        points.append(_normalize_point(item, f"goals[{index}]"))
+    return points
 
 
 def _normalize_path(path, width, height):
@@ -420,6 +470,204 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
     return result
 
 
+def _search_static_any(width, height, obstacles, goals, start, costs,
+                       trace, max_expanded):
+    """Static multi-goal search with exact lexicographic tie-breaking.
+
+    Every cell keeps its best known ``(g, path)`` pair; heap entries are
+    ``(f, g, path)`` with ``f = g + h`` and ``h`` the minimum Manhattan
+    distance over the goal set. Since every move strictly increases ``g``
+    and the lexicographically smallest minimum-cost path to a cell is
+    built from lexicographically smallest minimum-cost prefixes, a cell's
+    pair is final the first time it is popped, so every cell closes at
+    most once. Goal closings are collected until the heap's smallest f
+    exceeds the best goal cost; the winner is the lowest total cost, then
+    the goal ``(x, y)`` coordinate in lexicographic order, then the
+    complete path in lexicographic order. Ordering never depends on the
+    iteration order of the goal or obstacle collections.
+    """
+
+    def heuristic(point):
+        return min(abs(point[0] - gx) + abs(point[1] - gy)
+                   for gx, gy in goals)
+
+    def step_cost(point):
+        # Cost of entering ``point``; the start cell is never entered.
+        if costs is None:
+            return 1
+        return costs[point[1]][point[0]]
+
+    start_path = (start,)
+    open_heap = [(heuristic(start), 0, start_path)]
+    best = {start: (0, start_path)}  # best known (g, path) per cell
+    closed = set()
+    expanded_nodes = [] if trace else None
+    # Best goal closing so far, keyed exactly as the result tie-break
+    # specializes at a goal: (g, goal x, goal y, path). Closing a goal
+    # does not stop the search immediately: an equally cheap candidate
+    # (another goal, or a lexicographically smaller path) might still be
+    # undeveloped behind heap entries whose f equals the best goal cost.
+    best_key = None
+    budget_stop = False
+
+    while open_heap:
+        if best_key is not None and open_heap[0][0] > best_key[0]:
+            break
+        _, g, path = heapq.heappop(open_heap)
+        current = path[-1]
+        if current in closed or best[current] != (g, path):
+            continue  # stale heap entry; already closed with its best pair
+        if max_expanded is not None and len(closed) >= max_expanded:
+            # A live candidate remains but the budget is spent; close
+            # nothing more. A goal already closed still wins below.
+            budget_stop = True
+            break
+        closed.add(current)
+        if expanded_nodes is not None:
+            expanded_nodes.append(current)
+        if current in goals:
+            goal_key = (g, current[0], current[1], path)
+            if best_key is None or goal_key < best_key:
+                best_key = goal_key
+            continue  # routes end at a goal; never expanded past it
+        for dx, dy in _NEIGHBORS:
+            nxt = (current[0] + dx, current[1] + dy)
+            if not (0 <= nxt[0] < width and 0 <= nxt[1] < height):
+                continue
+            if nxt in obstacles:
+                continue
+            new_g = g + step_cost(nxt)
+            new_path = path + (nxt,)
+            known = best.get(nxt)
+            if known is None or (new_g, new_path) < known:
+                best[nxt] = (new_g, new_path)
+                heapq.heappush(
+                    open_heap, (new_g + heuristic(nxt), new_g, new_path)
+                )
+    if best_key is None:
+        result = {"path": None, "cost": None, "expanded": len(closed)}
+        if max_expanded is not None:
+            result["status"] = (
+                "budget_exhausted" if budget_stop else "unreachable"
+            )
+    else:
+        best_g, _, _, best_path = best_key
+        result = {
+            "path": list(best_path),
+            "cost": best_g,
+            "expanded": len(closed),
+        }
+        if max_expanded is not None:
+            result["status"] = "found"
+    if trace:
+        result["expanded_nodes"] = expanded_nodes
+    return result
+
+
+def _search_dynamic_any(width, height, obstacles, frames, start, goals,
+                        costs, trace, max_expanded):
+    """History-sensitive time-expanded multi-goal A*.
+
+    Same route-tree traversal as the single-goal dynamic search, but a
+    route may end at any candidate goal: the heuristic is the minimum
+    Manhattan distance over the goal set and a route closing on a goal
+    cell records a result candidate instead of finishing the search. A
+    candidate that a dynamic frame blocks at the route's arrival time is
+    simply never entered at that time; other arrival times still compete.
+    The winner is the lowest total cost, then the goal ``(x, y)``
+    coordinate in lexicographic order, then the complete path in
+    lexicographic order.
+    """
+
+    def heuristic(point):
+        return min(abs(point[0] - gx) + abs(point[1] - gy)
+                   for gx, gy in goals)
+
+    def step_cost(point):
+        # Cost of entering ``point``; the start cell is never entered.
+        if costs is None:
+            return 1
+        return costs[point[1]][point[0]]
+
+    last_frame = len(frames) - 1
+
+    def frame_cells(t):
+        return frames[t] if t <= last_frame else frames[last_frame]
+
+    # Heap entries mirror the single-goal dynamic search:
+    # (f, h, x, y, t, g, path, seen); the fixed numeric priority and the
+    # complete coordinate path make the ordering fully deterministic.
+    h0 = heuristic(start)
+    start_path = (start,)
+    open_heap = [(h0, h0, start[0], start[1], 0, 0, start_path,
+                  frozenset(start_path))]
+    closed_count = 0
+    expanded_nodes = [] if trace else None
+    # Best goal closing so far, keyed as the result tie-break specializes
+    # at a goal: (g, goal x, goal y, path). Since each move costs at
+    # least 1 and the minimum-Manhattan h changes by at most 1 per move,
+    # f never decreases along a route; once the smallest f on the heap
+    # exceeds the best goal cost, no route of that cost (or less) can
+    # remain undiscovered.
+    best_key = None
+    budget_stop = False
+
+    while open_heap:
+        if best_key is not None and open_heap[0][0] > best_key[0]:
+            break
+        if max_expanded is not None and closed_count >= max_expanded:
+            # Live route candidates remain but the budget is spent; close
+            # nothing more. A goal already closed still wins below.
+            budget_stop = True
+            break
+        _, _, x, y, t, g, path, seen = heapq.heappop(open_heap)
+        closed_count += 1  # every popped route node closes exactly once
+        if expanded_nodes is not None:
+            # Histories reaching the same (x, y, t) each record a triple,
+            # in the order their route nodes are actually closed.
+            expanded_nodes.append((x, y, t))
+        if (x, y) in goals:
+            goal_key = (g, x, y, path)
+            if best_key is None or goal_key < best_key:
+                best_key = goal_key
+            continue  # routes end at a goal; never expanded past it
+        next_t = t + 1
+        frame = frame_cells(next_t)
+        for dx, dy in _NEIGHBORS:
+            nx, ny = x + dx, y + dy
+            if not (0 <= nx < width and 0 <= ny < height):
+                continue
+            nxt = (nx, ny)
+            if nxt in obstacles or nxt in frame or nxt in seen:
+                continue  # static obstacle, timed obstacle, or revisit
+            new_g = g + step_cost(nxt)
+            new_path = path + (nxt,)
+            h = heuristic(nxt)
+            heapq.heappush(
+                open_heap,
+                (new_g + h, h, nx, ny, next_t, new_g, new_path,
+                 seen | {nxt}),
+            )
+    if best_key is None:
+        result = {"path": None, "cost": None, "expanded": closed_count}
+        if max_expanded is not None:
+            result["status"] = (
+                "budget_exhausted" if budget_stop else "unreachable"
+            )
+    else:
+        best_g, _, _, best_path = best_key
+        result = {
+            "path": list(best_path),
+            "cost": best_g,
+            "expanded": closed_count,
+        }
+        if max_expanded is not None:
+            result["status"] = "found"
+    if trace:
+        result["expanded_nodes"] = expanded_nodes
+    return result
+
+
 def plan(width, height, blocked, start, goal, costs=None, trace=False,
          dynamic_blocked=None, max_expanded=None):
     # --- Validation: everything is checked before the search begins. ---
@@ -532,6 +780,62 @@ def plan(width, height, blocked, start, goal, costs=None, trace=False,
     if trace:
         result["expanded_nodes"] = expanded_nodes
     return result
+
+
+def plan_any(width, height, blocked, start, goals, costs=None, trace=False,
+             dynamic_blocked=None, max_expanded=None):
+    # --- Validation: everything is checked before the search begins, ---
+    # --- in exactly the order ``plan`` uses, with ``goals`` taking   ---
+    # --- the slot ``goal`` occupies there.                           ---
+    width = _validate_dimension(width, "width")
+    height = _validate_dimension(height, "height")
+    start = _normalize_point(start, "start")
+    goal_points = _normalize_goals(goals)
+    _check_bounds(start, width, height, "start")
+    for index, point in enumerate(goal_points):
+        _check_bounds(point, width, height, f"goals[{index}]")
+    obstacles = _normalize_blocked(blocked, width, height)
+    if start in obstacles:
+        raise ValueError(f"start {start} lies on a blocked cell")
+    for index, point in enumerate(goal_points):
+        if point in obstacles:
+            raise ValueError(
+                f"goals[{index}] {point} lies on a blocked cell"
+            )
+    costs = _normalize_costs(costs, width, height)
+    if not isinstance(trace, bool):
+        raise TypeError(
+            f"trace must be a bool, got {type(trace).__name__}"
+        )
+    frames = _normalize_dynamic_blocked(dynamic_blocked, width, height)
+    if frames is not None and start in frames[0]:
+        raise ValueError(
+            f"start {start} is blocked at frame 0"
+        )
+    # The budget is validated last, after every pre-existing check.
+    if max_expanded is not None:
+        if not _is_int(max_expanded):
+            raise TypeError(
+                f"max_expanded must be an int, "
+                f"got {type(max_expanded).__name__}"
+            )
+        if max_expanded < 0:
+            raise ValueError(
+                f"max_expanded must be a non-negative integer, "
+                f"got {max_expanded}"
+            )
+    # Duplicate candidates merge; the goal iteration order never leaks
+    # into the search, the expansion order, or the result.
+    goal_set = frozenset(goal_points)
+    if frames is not None:
+        return _search_dynamic_any(
+            width, height, obstacles, frames, start, goal_set, costs,
+            trace, max_expanded
+        )
+    return _search_static_any(
+        width, height, obstacles, goal_set, start, costs, trace,
+        max_expanded
+    )
 
 
 def replay(width, height, blocked, start, goal, path, costs=None,

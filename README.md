@@ -13,6 +13,12 @@ Tests: python3 -m unittest discover -s tests -v
 
 `plan(width, height, blocked, start, goal, costs=None, trace=False, dynamic_blocked=None, max_expanded=None)` 默认返回 `{"path", "cost", "expanded"}`；`trace=True` 时额外返回 `expanded_nodes`；提供 `max_expanded` 时额外返回 `status`。
 
+`plan_any(width, height, blocked, start, goals, costs=None, trace=False, dynamic_blocked=None, max_expanded=None)` 与 `plan` 参数相同，只是单个 `goal` 换成非空候选终点序列 `goals`，返回一条到达其中某一终点的确定最低代价路线；返回结构与 `plan` 相同（含预算时的 `status` 与 `trace=True` 时的 `expanded_nodes`），`path` 末点即选中的候选终点，可直接交给 `replay` 以该末点为 `goal` 做离线核验，得到相同的 `cost` 与 `steps`。
+
+**多目标规划（`plan_any`）**
+- `goals` 必须是序列：字符串、字节串、`None` 或其他非序列抛 `TypeError`；空序列抛 `ValueError`。每个终点沿用 `goal` 的坐标规则：形状或坐标类型不合格抛 `TypeError`，越界或落在静态障碍上抛 `ValueError`。候选重复点合并，`goals` 的排列不影响任何结果。网格、`costs`、`trace`、`dynamic_blocked` 与预算的校验顺序及异常与 `plan` 完全一致；`start` 仍须通过静态障碍与动态第 0 帧检查。候选终点落在某动态帧上不在输入阶段报错：按该路线到达时刻被对应帧阻挡的路线判为不可达，其他到达时刻仍可参与竞争。
+- 搜索保留四邻域移动、禁止等待与回访、末帧持续与进入格子计价规则。总代价最小者优先；同价时先比较终点坐标的 `(x, y)` 字典序，再比较完整路径字典序。扩展顺序与轨迹不依赖 `goals`、`blocked` 及动态帧的内部迭代顺序；预算不会把已确定的较优路线替换成次优路线。没有任何可行终点时 `path`/`cost` 为 `None`。`goals` 含 `start` 时按既有 `start == goal` 规则返回单点零代价路线（含零预算行为）。
+
 **搜索预算（`max_expanded`）**
 - `max_expanded` 省略或为 `None` 时，返回键、值、异常类型与校验顺序与既有行为完全一致。提供时必须是非负且非布尔的整数：其他类型抛 `TypeError`，负数抛 `ValueError`；这些校验在全部既有网格、`costs`、`trace` 与 `dynamic_blocked` 校验（含第 0 帧检查）完成之后、搜索开始前进行。
 - 预算按关闭节点数计（即 `expanded` 的计数口径），达到上限后不再关闭任何节点。提供预算时结果始终额外携带 `status`：目标在限额内关闭为 `"found"`（返回既有的 `path`/`cost`）；候选耗尽仍未到达目标为 `"unreachable"`；尚有候选但预算耗尽为 `"budget_exhausted"`（`path`/`cost` 为 `None`，`expanded` 为实际关闭数，不超过 `max_expanded`）。

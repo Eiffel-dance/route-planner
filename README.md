@@ -11,7 +11,7 @@ Tests: python3 -m unittest discover -s tests -v
 
 ## API 约定
 
-`plan(width, height, blocked, start, goal, costs=None, trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None)` 默认返回 `{"path", "cost", "expanded"}`；`trace=True` 时额外返回 `expanded_nodes`；提供 `max_expanded` 或 `max_cost` 时额外返回 `status`；`snapshot=True` 且因预算耗尽返回 `budget_exhausted` 时额外返回 `checkpoint`。
+`plan(width, height, blocked, start, goal, costs=None, trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None, allow_wait=False)` 默认返回 `{"path", "cost", "expanded"}`；`trace=True` 时额外返回 `expanded_nodes`；提供 `max_expanded` 或 `max_cost` 时额外返回 `status`；`snapshot=True` 且因预算耗尽返回 `budget_exhausted` 时额外返回 `checkpoint`。
 
 **搜索预算（`max_expanded`）**
 - `max_expanded` 省略或为 `None` 时，返回键、值、异常类型与校验顺序与既有行为完全一致。提供时必须是非负且非布尔的整数：其他类型抛 `TypeError`，负数抛 `ValueError`；这些校验在全部既有网格、`costs`、`trace` 与 `dynamic_blocked` 校验（含第 0 帧检查）完成之后、搜索开始前进行。
@@ -25,20 +25,27 @@ Tests: python3 -m unittest discover -s tests -v
 - 提供 `max_cost` 时结果始终携带 `status`：成功为 `"found"`；没有可行终点时 `path`/`cost` 为 `None`，`expanded` 只统计实际关闭的节点，若有候选因超限被丢弃则为 `"cost_exhausted"`，否则为 `"unreachable"`；若同时给出 `max_expanded`，预算耗尽优先为 `"budget_exhausted"`。`trace` 仍只记录实际关闭的节点；`start == goal` 的单点零代价结果与零扩展预算的既有规则不变。
 - `snapshot=True` 生成的 checkpoint 在提供 `max_cost` 时记录该值（未提供时不新增字段）；`resume` 对缺少该字段的旧 checkpoint 按 `None` 兼容，字段存在时按同一规则校验（类型错误抛 `TypeError`，负值或与内部状态不一致抛 `ValueError`），所有检查先于恢复搜索，且恢复结果与一次未暂停的调用完全一致。`replay` 不接受 `max_cost` 参数。
 
-`plan_any(width, height, blocked, start, goals, costs=None, trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None)` 接受与 `plan` 相同的网格、`blocked`、`start` 及可选代价、轨迹、动态障碍、预算、快照和代价上限参数，另收一个非空 `goals` 候选终点序列，返回一条确定的最低代价路线（返回结构与 `plan` 相同，`path` 末点为选中的候选终点）；该路径可直接以其末点作为 `goal` 交给 `replay` 离线核验。
+**原地等待（`allow_wait`）**
+- `plan`、`plan_any`、`plan_batch`、`plan_multi_start`、`plan_k` 与 `replay` 接受可选布尔参数 `allow_wait`，默认 `False`。省略、为 `False`，或 `dynamic_blocked` 省略、为 `None`、为空序列时，返回键、值、异常类型与顺序、四邻域移动、禁止重复坐标与全部 tie-break 与既有行为完全一致。非布尔值在 `dynamic_blocked` 校验（含第 0 帧检查）之后、预算与快照校验之前抛 `TypeError`；其他异常的类型与顺序不变。
+- `allow_wait=True` 且启用动态帧时，路线可从时刻 `t` 在当前格停留到 `t+1`：下一帧该格必须未被障碍占用，且只能在最后一个已提供帧之前等待（末帧之后持续复用末帧但不再生成等待）。等待不增加进入格代价（移动仍按 `costs` 累计），连续等待可重复同一坐标；一旦离开某格仍不得重新进入任何已访问坐标。`start == goal` 仍只返回单点零代价结果。
+- 最小总代价、终点选择与完整路径字典序沿用现有规则，扩展优先级仍为 f、h、坐标、时间、完整路径，结果不依赖障碍集合或帧内坐标的输入顺序。等待状态按关闭次数计入 `expanded`，`trace` 记录其 `(x, y, t)` 三元组；`max_expanded` 可截断这些状态，`max_cost` 只限制移动产生的累计进入格代价（等待免费），`status` 取值与优先级不变。`plan_k`、`plan_batch`、多终点与多起点遵循同一等待语义，成功路径交给 `replay`（同样传 `allow_wait=True`）得到相同 `cost` 与 `steps`，`steps` 包含等待动作。
+- 预算耗尽的 `checkpoint` 在启用等待时记录 `allow_wait`；`resume` 的结果与一次未暂停调用完全一致。缺少该字段的旧 checkpoint 按 `False` 兼容，字段非布尔抛 `TypeError`，与内部状态不一致（无等待标记却含停留、或末帧之后停留）抛 `ValueError`。
+- `replay` 启用等待时只接受动态帧范围内的连续停留：静态（无帧）停留、末帧之后停留或非连续回访都返回既有无效结构；`diagnose=True` 时末帧之后停留使用唯一错误名 `wait_after_final_frame`（指向该下标），其余情形沿用既有错误名与优先级。
+
+`plan_any(width, height, blocked, start, goals, costs=None, trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None, allow_wait=False)` 接受与 `plan` 相同的网格、`blocked`、`start` 及可选代价、轨迹、动态障碍、预算、快照、代价上限与等待参数，另收一个非空 `goals` 候选终点序列，返回一条确定的最低代价路线（返回结构与 `plan` 相同，`path` 末点为选中的候选终点）；该路径可直接以其末点作为 `goal` 交给 `replay` 离线核验。
 
 **多终点（`goals`）**
 - 外层必须是非空序列：字符串、字节串、`None` 或其他非序列抛 `TypeError`，空序列抛 `ValueError`。每个终点沿用坐标的结构和整数规则：元素形状或坐标类型不合格抛 `TypeError`，越界或落在静态障碍上抛 `ValueError`。`goals` 在 `plan` 校验序列中占据 `goal` 的位置，网格、`costs`、`trace`、`dynamic_blocked` 与预算的校验顺序及异常类型沿用 `plan`；`start` 仍须通过静态障碍与动态第 0 帧检查。
 - 重复候选点合并，输入排列（以及 `blocked`、帧内坐标的迭代顺序）不影响任何结果。
 - 候选终点在某条路线到达的时间帧被动态障碍阻挡时不在输入阶段报错：该路线按其时间帧不可达，其他到达时刻仍可参与竞争；末帧之后持续使用最后一帧。
-- 搜索保留四邻域移动、禁止等待和回访、进入格子的代价累计。总 `cost` 最小者优先；同价时先比较终点坐标 `(x, y)` 字典序，再比较完整路径字典序。与动态 `plan` 同理，经不同历史到达同一格子的路线是不同状态、互不剪枝；`trace` 在静态模式记录坐标二元组、动态模式记录 `(x, y, t)` 三元组，且只记录实际关闭的节点。
+- 搜索保留四邻域移动、禁止回访、进入格子的代价累计，未启用 `allow_wait` 时禁止等待。总 `cost` 最小者优先；同价时先比较终点坐标 `(x, y)` 字典序，再比较完整路径字典序。与动态 `plan` 同理，经不同历史到达同一格子的路线是不同状态、互不剪枝；`trace` 在静态模式记录坐标二元组、动态模式记录 `(x, y, t)` 三元组，且只记录实际关闭的节点。
 - 没有任何可行终点时 `path`/`cost` 为 `None`；提供预算时按既有规则返回 `status` 为 `found`、`unreachable` 或 `budget_exhausted`，提供 `max_cost` 时同样始终携带 `status`（规则与 `plan` 一致，含 `cost_exhausted`），预算或上限不会把已确定的较优路线替换成严格次优（更贵）的路线。`goals` 含 `start` 时按既有 `start == goal` 单点零代价规则处理（零预算同样为 `budget_exhausted`）。
 
-`plan_k(width, height, blocked, start, goal, k, costs=None, dynamic_blocked=None, max_expanded=None, max_cost=None)` 在一次请求中返回同一栅格上按优先级排列的前 `k` 条候选路线，供离线比较多条可行方案；可选的 `max_expanded` 与 `max_cost` 在不改变既有顺序与 tie-break 的前提下安全地暂停或限制搜索。
+`plan_k(width, height, blocked, start, goal, k, costs=None, dynamic_blocked=None, max_expanded=None, max_cost=None, allow_wait=False)` 在一次请求中返回同一栅格上按优先级排列的前 `k` 条候选路线，供离线比较多条可行方案；可选的 `max_expanded` 与 `max_cost` 在不改变既有顺序与 tie-break 的前提下安全地暂停或限制搜索。
 
 **前 k 条路线（`k`）**
 - 先沿用 `plan` 对尺寸、坐标、静态障碍、正整数代价矩阵与动态帧的类型及取值校验（含第 0 帧 `start` 检查），这些共享检查全部完成后再检查 `k`：`k` 必须是非布尔正整数，类型错误抛 `TypeError`，非正值（0 或负数）抛 `ValueError`；`k` 检查之后、搜索开始之前再校验可选的 `max_expanded` 与 `max_cost`，二者分别复用 `plan` 的非负且非布尔整数规则（其他类型抛 `TypeError`，负数抛 `ValueError`）。所有错误在搜索开始前确定。`plan_k` 不接受 `trace`、`snapshot` 参数。
-- 搜索仍只允许四邻域移动，起点代价为零，进入格子的代价按 `costs` 累加（未提供时每步为 1），路径不得越过静态障碍或路径下标对应时间帧的动态障碍（超过末帧持续使用末帧），也不得重复坐标或原地等待。经不同完整坐标历史到达同一位置的候选是不同状态、不提前合并，因此不同完整坐标序列始终是不同候选，静态与动态模式一致。
+- 搜索仍只允许四邻域移动，起点代价为零，进入格子的代价按 `costs` 累加（未提供时每步为 1），路径不得越过静态障碍或路径下标对应时间帧的动态障碍（超过末帧持续使用末帧），也不得重复坐标，未启用 `allow_wait` 时亦不得原地等待。经不同完整坐标历史到达同一位置的候选是不同状态、不提前合并，因此不同完整坐标序列始终是不同候选，静态与动态模式一致。
 - 返回对象固定包含 `paths`、`costs`、`expanded`：`paths` 为最多 `k` 条唯一完整路线，按总代价升序、同价按完整坐标序列字典序排列；`costs` 与 `paths` 逐项对应，且首条路线即 `plan` 返回的路线。没有可行路线时两个数组均为空，`expanded` 仍报告为确定结果而实际关闭的候选状态数：每个完整历史只计一次，被过滤（越界、静态/动态障碍、回访）或仍未关闭的候选不计入；第 `k` 条目标路线一关闭即停止，因此较小的 `k` 比较大的 `k` 关闭更少候选。`start == goal` 时只返回单点零代价路线并统计一次扩展。
 - 无论静态还是动态结果，每条路线都可逐条交给 `replay`（以路线末点作为 `goal`）并得到相同代价和步数（`steps == len(path) - 1`）。结果不依赖障碍集合、目标参数、代价矩阵行序或动态帧/帧内坐标的输入顺序。
 
@@ -46,21 +53,21 @@ Tests: python3 -m unittest discover -s tests -v
 - 二者省略或为 `None` 时，`plan_k` 的返回键、值、顺序、`expanded` 计数与异常边界与既有行为完全一致。只要任一限制显式提供，结果额外携带 `status`；不提供时不增加该键。
 - `max_cost` 与 `plan` 同一口径地约束从起点累计的进入格子代价：起点仍为 0，恰好等于上限的候选仍参与竞争，累计超过上限的候选在生成时立即丢弃；它不改变合法路径之间的 tie-break，也不会把已确定的较优路线替换成严格更差的路线。
 - `max_expanded` 按实际关闭的完整路径候选计数（即 `expanded` 的口径），达到上限后不得再关闭任何候选；它只能截断搜索，不能替换已经确定的前若干名结果。提前结束时仍返回已关闭的路线与逐项对应的代价并保留排名顺序，一条都没有时使用空列表，`expanded` 为实际关闭数。
-- `status` 取值：凑齐 `k` 条路线，或搜索自然耗尽但至少找到一条路线时为 `"found"`；未凑齐 `k` 且扩展上限截断时仍有待处理候选为 `"budget_exhausted"`；未凑齐 `k`、未发生预算截断且至少一个候选因代价上限被丢弃为 `"cost_exhausted"`；没有任何路线且既无预算截断也无代价丢弃时为 `"unreachable"`。两种截断同时发生时 `"budget_exhausted"` 优先。动态模式继续沿用持久化末帧、禁止等待、禁止回访和可由 `replay` 验证的语义。
+- `status` 取值：凑齐 `k` 条路线，或搜索自然耗尽但至少找到一条路线时为 `"found"`；未凑齐 `k` 且扩展上限截断时仍有待处理候选为 `"budget_exhausted"`；未凑齐 `k`、未发生预算截断且至少一个候选因代价上限被丢弃为 `"cost_exhausted"`；没有任何路线且既无预算截断也无代价丢弃时为 `"unreachable"`。两种截断同时发生时 `"budget_exhausted"` 优先。动态模式继续沿用持久化末帧、禁止回访和可由 `replay` 验证的语义，未启用 `allow_wait` 时禁止等待。
 
-`plan_batch(width, height, blocked, requests, costs=None, trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None)` 在一次调用中处理同一共享栅格上的多个独立单起点单终点查询：返回 `{"results": [...]}`，按 `requests` 顺序给出每个查询逐次调用 `plan` 应得到的结果；重复请求保留并各自独立作答。
+`plan_batch(width, height, blocked, requests, costs=None, trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None, allow_wait=False)` 在一次调用中处理同一共享栅格上的多个独立单起点单终点查询：返回 `{"results": [...]}`，按 `requests` 顺序给出每个查询逐次调用 `plan` 应得到的结果；重复请求保留并各自独立作答。
 
 **批量规划（`requests`）**
 - 共享参数（尺寸、`blocked`、`costs`、`trace`、`dynamic_blocked`、`max_expanded`、`snapshot`、`max_cost`）沿用 `plan` 的校验规则与顺序；`requests` 在校验序列中占据 `start`/`goal` 的位置。`requests` 必须是非空序列：`None`、字符串、字节串或其他非序列抛 `TypeError`，空序列抛 `ValueError`。每个元素必须是恰好含两个坐标的二元序列 `[start, goal]`：元素形状或坐标类型错误抛 `TypeError`；坐标越界、端点落在静态障碍上、动态第 0 帧阻塞某个起点抛 `ValueError`。全部校验在任意搜索开始前完成，非法批次绝不返回部分结果。
 - 每个查询都是一次独立的 `plan` 搜索：`path`、`cost`、`expanded` 按请求分别产生，`max_expanded` 预算与 `max_cost` 上限按查询各自生效，查询之间不共享任何搜索状态。`trace`、`status`、`expanded_nodes`、`checkpoint`、动态帧、`start == goal`、不可达与 `cost_exhausted` 的语义与 `plan` 完全一致；`budget_exhausted` 结果携带的 `checkpoint` 可直接交给 `resume` 继续。
 - 成功路径以其对应 `goal` 结尾，可逐条交给 `replay` 离线核验并得到相同代价与步数。重复障碍与帧内坐标合并，障碍集合或 `requests` 的排列不改变任何单条结果；整个返回对象可 JSON 序列化保存。
 
-`plan_multi_start(width, height, blocked, starts, goal, costs=None, trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None)` 在一次调用中从多个候选起点规划到同一终点，返回一条确定路线（返回结构与 `plan` 相同，`path` 以获胜起点开头、以 `goal` 结尾）；该路径可直接以首点为 `start`、末点为 `goal` 交给 `replay` 离线核验。
+`plan_multi_start(width, height, blocked, starts, goal, costs=None, trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None, allow_wait=False)` 在一次调用中从多个候选起点规划到同一终点，返回一条确定路线（返回结构与 `plan` 相同，`path` 以获胜起点开头、以 `goal` 结尾）；该路径可直接以首点为 `start`、末点为 `goal` 交给 `replay` 离线核验。
 
 **多起点（`starts`）**
 - 外层必须是非空序列：`None`、字符串、字节串或其他非序列抛 `TypeError`，空序列抛 `ValueError`。每个起点沿用坐标的结构和整数规则：元素形状或坐标类型不合格抛 `TypeError`，越界或落在静态障碍上抛 `ValueError`。`starts` 在 `plan` 校验序列中占据 `start` 的位置，网格、`costs`、`trace`、`dynamic_blocked`、预算、快照与代价上限的校验顺序及异常类型沿用 `plan`；动态第 0 帧阻塞任一起点同样抛 `ValueError`，全部检查先于搜索。
 - 重复起点合并并排序，输入排列（以及 `blocked`、帧内坐标的迭代顺序）不影响任何结果。
-- 静态模式把各起点作为 `g == 0` 的根且每个坐标只关闭一次；动态模式沿用持久化末帧、禁止等待和重复坐标，经不同历史到达同一 `(x, y, t)` 的路线是不同状态、互不剪枝。
+- 静态模式把各起点作为 `g == 0` 的根且每个坐标只关闭一次；动态模式沿用持久化末帧、禁止重复坐标（未启用 `allow_wait` 时亦禁止等待），经不同历史到达同一 `(x, y, t)` 的路线是不同状态、互不剪枝。
 - 按总 `cost` 最小选路，同价按完整 `path` 字典序决定；扩展顺序固定为 f、h、`(x, y)`（动态再加 t）、最后按完整路径，因此结果不依赖起点输入顺序。`cost` 只算进入格子的代价（获胜起点为 0），`expanded` 只计关闭的候选，无路时 `path`/`cost` 为 `None`。
 - `trace=True` 时静态模式记录唯一坐标关闭序列、动态模式记录 `(x, y, t)` 关闭序列，且 `expanded == len(expanded_nodes)`。`starts` 含 `goal` 时按 `plan` 的 `start == goal` 单点零代价规则处理（零预算同样为 `budget_exhausted`）。
 - `max_expanded` 与 `max_cost` 沿用 `plan` 的 `status` 与预算优先规则：超代价候选丢弃且不计入 `expanded`，二者均不改变无上限路线与 tie-break。`snapshot=True` 因预算耗尽返回可 JSON 序列化的 `checkpoint`（记录排序后的 `starts`、网格约束、动态帧、提供时的代价上限与待处理状态），`resume` 按累计预算、不重复计数、仅再次预算耗尽才返回新 `checkpoint` 的规则继续搜索，非法 `checkpoint` 沿用 `resume` 既有的 `TypeError`/`ValueError` 边界。
@@ -79,7 +86,7 @@ Tests: python3 -m unittest discover -s tests -v
 - `targets` 与 `distances` 同形：可达格子记录为其提供最小距离的终点坐标，障碍与不可达格子为 `None`，终点记录自身；等价距离时选 `(x, y)` 字典序更小的终点，选择不依赖终点输入顺序。
 - `expanded` 统计每个可达格子首次关闭一次（包含全部终点），关闭顺序固定为先距离后 `(x, y)` 字典序；`expanded_nodes` 按此顺序记录且长度等于 `expanded`。矩阵尺寸、`None` 约定、代价语义、关闭顺序与结果完全确定、可 JSON 序列化并离线保存。
 
-`replay(width, height, blocked, start, goal, path, costs=None, dynamic_blocked=None, diagnose=False)` 用于离线核验一条已保存的候选路径并重新计算代价；它不执行搜索，返回值不含 `expanded` 或 `expanded_nodes` 字段，且不接受 `trace` 参数。
+`replay(width, height, blocked, start, goal, path, costs=None, dynamic_blocked=None, diagnose=False, allow_wait=False)` 用于离线核验一条已保存的候选路径并重新计算代价；它不执行搜索，返回值不含 `expanded` 或 `expanded_nodes` 字段，且不接受 `trace` 参数。
 
 **快照与恢复（`snapshot` 与 `resume`）**
 - `snapshot` 只能是布尔值，默认 `False`；省略或为 `False` 时 `plan`/`plan_any` 的返回键、值、异常类型、校验顺序、tie-break、不可达结果与轨迹完全不变。非布尔值在全部既有校验（含 `max_expanded` 校验）之后、搜索开始前抛 `TypeError`。
@@ -94,6 +101,7 @@ Tests: python3 -m unittest discover -s tests -v
   - `start_mismatch`：首点不是 `start`，下标 0；
   - `goal_mismatch`：末点不是 `goal`，下标为末点（`len(path) - 1`）；
   - `start_goal_extra`：`start == goal` 却含多余点，下标 1；
+  - `wait_after_final_frame`：启用等待时在末帧之后停留，指向该点；
   - `repeated_coordinate`：重复坐标，指向第二次出现的位置；
   - `non_adjacent`：相邻点不是四邻域移动，指向后一个点；
   - `static_blocked`：经过静态障碍，指向该点；
@@ -129,7 +137,7 @@ Tests: python3 -m unittest discover -s tests -v
 
 **动态障碍（`dynamic_blocked`）**
 - `dynamic_blocked` 省略、为 `None` 或为空序列时与未启用完全等价；否则必须是按时间帧排列的序列，每一帧是该帧禁行坐标的可迭代集合。第 0 帧约束 `start`，路径下标 `t` 处的坐标必须同时避开静态障碍和第 `t` 帧，超过最后一帧后持续使用最后一帧。
-- 每一步仍只能向四邻域移动，不允许原地等待或重复坐标；`cost` 仍按进入格子的代价累计，起点不计。由于路线的可延续性取决于它已访问的坐标序列，到达同一 `(x, y, t)` 但历史不同的候选是不同状态，互不剪枝：所有满足约束的路线都能被搜索到。
+- 每一步仍只能向四邻域移动，不允许重复坐标，未启用 `allow_wait` 时亦不允许原地等待；`cost` 仍按进入格子的代价累计，起点不计。由于路线的可延续性取决于它已访问的坐标序列，到达同一 `(x, y, t)` 但历史不同的候选是不同状态，互不剪枝：所有满足约束的路线都能被搜索到。
 - 返回总代价最小的可行路径；总代价相同时，固定优先级依次为 f、h、x、y、t，仍相同时按完整坐标路径的字典序决定取舍，因此结果不依赖障碍集合、帧内坐标顺序或遍历顺序。
 - 动态模式下 `expanded_nodes` 按实际关闭顺序记录 `(x, y, t)` 三元组，`expanded` 按条目计数；被丢弃的候选不记录。同一 `(x, y, t)` 若由不同历史分别关闭，其三元组按关闭顺序分别出现，`expanded` 逐条计数。不可达时 `path`/`cost` 为 `None`。
 - 校验：外层必须是序列，每一帧必须是可迭代坐标集合；字符串/字节串、非二整数坐标抛出 `TypeError`，越界坐标抛出 `ValueError`，帧内重复坐标合并；`start` 在第 0 帧被禁止时抛出 `ValueError`。所有校验在搜索开始前完成，既有校验顺序不变。

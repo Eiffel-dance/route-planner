@@ -2,19 +2,20 @@
 
 Public entry points: ``plan(width, height, blocked, start, goal, costs=None,
 trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False,
-max_cost=None)``, ``plan_any(width, height, blocked, start, goals,
-costs=None, trace=False, dynamic_blocked=None, max_expanded=None,
-snapshot=False, max_cost=None)``,
+max_cost=None, allow_wait=False)``, ``plan_any(width, height, blocked,
+start, goals, costs=None, trace=False, dynamic_blocked=None,
+max_expanded=None, snapshot=False, max_cost=None, allow_wait=False)``,
 ``plan_k(width, height, blocked, start, goal, k, costs=None,
-dynamic_blocked=None, max_expanded=None, max_cost=None)``,
+dynamic_blocked=None, max_expanded=None, max_cost=None,
+allow_wait=False)``,
 ``plan_batch(width, height, blocked, requests, costs=None, trace=False,
 dynamic_blocked=None, max_expanded=None, snapshot=False,
-max_cost=None)``,
+max_cost=None, allow_wait=False)``,
 ``plan_multi_start(width, height, blocked, starts, goal, costs=None,
 trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False,
-max_cost=None)``,
+max_cost=None, allow_wait=False)``,
 ``replay(width, height, blocked, start, goal, path, costs=None,
-dynamic_blocked=None, diagnose=False)``,
+dynamic_blocked=None, diagnose=False, allow_wait=False)``,
 ``resume(checkpoint, max_expanded=None)``,
 ``distance_field(width, height, blocked, goal, costs=None, trace=False)``
 and
@@ -107,8 +108,9 @@ Dynamic obstacles (``dynamic_blocked``):
   are blocked at that time frame. Frame 0 constrains ``start``; the
   coordinate at path index ``t`` must avoid both the static obstacles and
   frame ``t``, and frames beyond the last one reuse the last frame.
-- Moves are still four-neighborhood only: no waiting in place and no
-  repeated coordinates along the path. Because feasibility of a route
+- Moves are still four-neighborhood only: no repeated coordinates along
+  the path and, unless ``allow_wait`` is enabled, no waiting in place
+  either. Because feasibility of a route
   depends on the coordinates it already visited, candidates that reach the
   same ``(x, y, t)`` through different coordinate histories are distinct
   states and are never merged: every route that satisfies the constraints
@@ -131,6 +133,54 @@ Dynamic obstacles (``dynamic_blocked``):
   duplicates within a frame are merged, and a ``start`` blocked at frame 0
   raises ``ValueError``. All checks run before the search starts.
 
+Waiting in place (``allow_wait``):
+- ``plan``, ``plan_any``, ``plan_batch``, ``plan_multi_start``, ``plan_k``
+  and ``replay`` accept a final optional ``allow_wait=False`` flag.
+  Omitting it or passing ``False`` -- or calling with ``dynamic_blocked``
+  omitted, ``None`` or empty -- keeps every key, value, exception type,
+  validation order, four-neighborhood move, no-repeated-coordinate rule
+  and tie-break of the previous behavior untouched. A non-bool value
+  raises ``TypeError`` after the ``dynamic_blocked`` validation (the
+  frame-0 check included) and before the budget, snapshot and cost-limit
+  checks; every other exception type and order is unchanged.
+- With ``allow_wait=True`` and dynamic frames, a route may stay at its
+  current cell from time ``t`` to ``t + 1`` -- but only while the frame
+  it would occupy is one of the provided frames (past the last frame the
+  last frame persists and no wait is generated), and only if that cell
+  is free at the next frame. A wait adds no entering-cell cost (moves
+  still cost ``costs``) and no new coordinate: consecutive waits may
+  repeat the current coordinate, but once a cell is left it can never be
+  re-entered. ``start == goal`` still yields only the single-point
+  zero-cost result.
+- The minimum total cost, the endpoint choice and the complete-path
+  lexicographic order follow the existing rules; the fixed priority is
+  still f, h, the coordinates, the time and then the complete path, so
+  the result never depends on obstacle-set or in-frame input order.
+  Wait states count toward ``expanded`` once per closing like any other
+  state, the trace records their coordinates and times, ``max_expanded``
+  may truncate them, ``max_cost`` only caps the accumulated
+  entering-cell cost of moves (waits are free), and the ``status``
+  values and priorities are unchanged. ``plan_k``, ``plan_batch``,
+  multi-goal and multi-start results follow the same wait semantics,
+  and a successful path verifies offline in ``replay`` (called with
+  ``allow_wait=True``) with the same cost and step count, the steps
+  including the wait actions.
+- With ``snapshot=True`` a budget-exhausted checkpoint records
+  ``allow_wait`` when it was enabled, and ``resume`` continues with the
+  same wait semantics so the result equals one uninterrupted call. A
+  checkpoint without the field (written before it existed, or by a
+  search without waiting) restores as ``False``; a present non-bool
+  field raises ``TypeError``, and a state inconsistent with the recorded
+  flag (a wait without it, or a wait past the final frame) raises
+  ``ValueError``.
+- ``replay`` with ``allow_wait=True`` accepts consecutive stays only
+  within the provided dynamic frames: a stay in static mode (no frames),
+  a stay past the final frame, or a non-consecutive revisit all return
+  the usual invalid structure. With ``diagnose=True`` a stay past the
+  final frame is reported with the unique error name
+  ``wait_after_final_frame`` (at the offending index); every other case
+  keeps the existing error names and precedence.
+
 Multi-goal planning (``plan_any``):
 - ``plan_any(width, height, blocked, start, goals, ...)`` accepts the same
   grid, blocked, start, costs, trace, dynamic_blocked and max_expanded
@@ -147,8 +197,9 @@ Multi-goal planning (``plan_any``):
   coordinate types raise ``TypeError``); out-of-bounds coordinates and
   endpoints on static obstacles raise ``ValueError``. Repeated candidates
   merge, so the input ordering never changes any result.
-- The search keeps four-neighborhood moves, no waiting, no revisits, the
-  persistent last frame and the entering-cell cost accumulation. A
+- The search keeps four-neighborhood moves, no revisits, the persistent
+  last frame, no waiting unless ``allow_wait`` is enabled, and the
+  entering-cell cost accumulation. A
   candidate blocked by the dynamic frame at the time a particular route
   arrives is not rejected up front (its coordinate is statically valid);
   that arrival is simply infeasible for that route's time frame while
@@ -177,7 +228,8 @@ Top-k planning (``plan_k``):
   several distinct feasible routes on the same grid in one call. It
   first performs exactly ``plan``'s shared validation for the
   dimensions, coordinates, static obstacles, positive integer cost
-  matrix and dynamic frames (including the frame-0 start check), and
+  matrix and dynamic frames (including the frame-0 start check), then
+  the ``allow_wait`` flag (a non-bool value raises ``TypeError``), and
   only then checks ``k``: a non-bool positive integer is required,
   wrong types raise ``TypeError`` and non-positive values raise
   ``ValueError``. The optional ``max_expanded`` and ``max_cost``
@@ -189,7 +241,8 @@ Top-k planning (``plan_k``):
   ``trace`` or ``snapshot`` argument.
 - The search keeps four-neighborhood moves, the zero start cost, the
   entering-cell cost accumulation, the persistent last frame, the ban on
-  waiting in place and on repeated coordinates, and the static/frame
+  repeated coordinates, the ban on waiting in place unless
+  ``allow_wait`` is enabled, and the static/frame
   feasibility rules. Routes that reach the same cell through different
   coordinate histories are distinct candidates and are never merged, in
   both static and dynamic mode, so different complete coordinate
@@ -286,7 +339,8 @@ Multi-start planning (``plan_multi_start``):
   lexicographically smallest complete coordinate sequence -- an ordering
   preserved under common extensions, so a dominated candidate can never
   win later). In dynamic mode the persistent last frame, the ban on
-  waiting and on repeated coordinates apply, and routes reaching the
+  repeated coordinates and -- unless ``allow_wait`` is enabled -- on
+  waiting apply, and routes reaching the
   same ``(x, y, t)`` through different coordinate histories are distinct
   states that are never merged.
 - The winning route has the smallest total ``cost``; ties are decided by
@@ -307,7 +361,8 @@ Multi-start planning (``plan_multi_start``):
   and neither limit ever changes the unlimited route or the tie-breaks.
   With ``snapshot=True`` a budget stop returns a JSON-serializable
   checkpoint recording the sorted starts, the grid constraints, the
-  dynamic frames, the cost limit when one was provided and the complete
+  dynamic frames, the cost limit when one was provided, the allow-wait
+  flag when waiting was enabled and the complete
   pending state; ``resume`` continues it with the cumulative-budget,
   no-double-counting and only-budget-exhausted-snapshots rules of the
   other planners, and invalid checkpoints follow ``resume``'s usual
@@ -327,8 +382,9 @@ Snapshots and resumable planning (``snapshot`` and ``resume``):
   carry the field.
 - The checkpoint records the snapshot version, the planner kind, the
   normalized grid constraints (dimensions, obstacles, start, goal or
-  candidate goals, costs, dynamic frames and the cost limit when one was
-  provided), the closed-node count, the
+  candidate goals, costs, dynamic frames, the cost limit when one was
+  provided and the allow-wait flag when waiting was enabled), the
+  closed-node count, the
   trace recorded so far and the complete pending-candidate state. Every
   set-derived list is stored sorted, so neither obstacle-set iteration
   order, goal order nor in-frame coordinate order influences the
@@ -353,7 +409,12 @@ Snapshots and resumable planning (``snapshot`` and ``resume``):
   fields or wrongly typed fields raises ``TypeError``; an unsupported
   snapshot version or planner kind, grid constraints that violate the
   usual ``plan`` rules (obstacles, endpoints, costs, dynamic frames) or
-  an internally inconsistent state raise ``ValueError``. Every check is
+  an internally inconsistent state raise ``ValueError``. The optional
+  ``allow_wait`` field restores as ``False`` when absent (the only
+  possibility in checkpoints written before waiting existed), raises
+  ``TypeError`` when it is not a bool, and a state inconsistent with the
+  recorded flag (a wait without it, or a wait past the final frame)
+  raises ``ValueError``. Every check is
   decided before any searching, and ``resume``'s ``max_expanded`` follows
   the same non-negative-integer rules as ``plan``'s.
 
@@ -375,7 +436,10 @@ Offline replay (``replay``):
   by frame ``t`` at path index ``t`` (the last frame persists for later
   indices; omitted/empty ``dynamic_blocked`` means static-only checks),
   non-four-neighbor adjacency, repeated coordinates, or extra points when
-  ``start == goal``.
+  ``start == goal``. With ``allow_wait=True`` a consecutive stay is
+  admissible instead of a repeat/adjacency violation, but only within the
+  provided dynamic frames: a stay with no frames, a stay past the final
+  frame, or a non-consecutive revisit stays invalid.
 - A valid path returns ``{"valid": True, "cost": int, "steps": int}``
   where ``steps == len(path) - 1`` and ``cost`` is recomputed with the
   same entering-cell rule ``plan`` uses (sum of the costs of the cells
@@ -391,7 +455,9 @@ Offline replay (``replay``):
   the first offending element, with ``cost``/``steps`` still ``None``.
   The codes, in fixed precedence order, are ``start_mismatch`` (index
   0), ``goal_mismatch`` (index of the last element),
-  ``start_goal_extra`` (index 1), ``repeated_coordinate`` (the second
+  ``start_goal_extra`` (index 1), ``wait_after_final_frame`` (a stay
+  past the last provided frame, only possible with ``allow_wait``),
+  ``repeated_coordinate`` (the second
   occurrence), ``non_adjacent`` (the later element of the pair),
   ``static_blocked`` and ``dynamic_blocked`` (the offending element);
   ties resolve to the earliest rule in this list and no partial cost is
@@ -761,6 +827,17 @@ def _validate_snapshot_flag(snapshot):
         )
 
 
+def _validate_allow_wait(allow_wait):
+    # The shared allow-wait flag rules used by every planner and by
+    # ``replay``: a non-bool value raises ``TypeError``. The check runs
+    # after the ``dynamic_blocked`` validation (the frame-0 check
+    # included) and before the budget, snapshot and cost-limit checks.
+    if not isinstance(allow_wait, bool):
+        raise TypeError(
+            f"allow_wait must be a bool, got {type(allow_wait).__name__}"
+        )
+
+
 def _validate_max_cost(max_cost):
     # The shared non-negative-integer cost-limit rules used by ``plan``
     # and ``plan_any`` (and by ``resume`` for a checkpoint field): other
@@ -789,7 +866,8 @@ def _status_for(budget_stop, cost_limited):
 
 
 def _search_static(width, height, obstacles, start, goal, costs, trace,
-                   max_expanded, max_cost=None, snapshot=False, state=None):
+                   max_expanded, max_cost=None, snapshot=False,
+                   allow_wait=False, state=None):
     """Classic static-grid A* (the ``plan`` search without frames).
 
     Cells are merged by coordinate: the best known ``g`` per cell is kept
@@ -800,7 +878,8 @@ def _search_static(width, height, obstacles, start, goal, costs, trace,
     remembers whether any discard happened (``cost_limited``) so a
     failure can be reported as ``cost_exhausted``; the flag is part of
     the snapshot state so a resumed search stays equivalent to one
-    uninterrupted call. With
+    uninterrupted call. ``allow_wait`` has no effect without frames and
+    is only carried through so a checkpoint can record it. With
     ``snapshot=True`` a budget stop additionally returns a checkpoint of
     the complete search state; ``state`` carries such a snapshot back in
     so ``resume`` continues the identical traversal. The snapshot needs
@@ -902,24 +981,33 @@ def _search_static(width, height, obstacles, start, goal, costs, trace,
             max_cost, len(closed), expanded_nodes,
             _static_snapshot_state(open_heap, came_from, g_score, closed,
                                    cost_limited, max_cost),
+            allow_wait,
         )
     return result
 
 
 def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
                     trace, max_expanded, max_cost=None, snapshot=False,
-                    state=None):
+                    allow_wait=False, state=None):
     """History-sensitive time-expanded A*.
 
     Frame ``t`` constrains the cell occupied at path index ``t``; frames
-    past the last one reuse the last frame. Waiting in place and repeated
-    coordinates are forbidden, so whether a candidate route can be
-    extended depends on the exact sequence of cells it already visited:
-    two routes reaching the same ``(x, y, t)`` with different histories
-    are distinct states and neither may prune the other (the route with
-    the larger accumulated cost can be the only one that remains
-    extendable). Each heap node therefore carries its complete path; the
-    search is a best-first traversal of the feasible route tree. Goal
+    past the last one reuse the last frame. Repeated coordinates are
+    forbidden and, unless ``allow_wait`` is true, so is waiting in place,
+    so whether a candidate route can be extended depends on the exact
+    sequence of cells it already visited: two routes reaching the same
+    ``(x, y, t)`` with different histories are distinct states and
+    neither may prune the other (the route with the larger accumulated
+    cost can be the only one that remains extendable). Each heap node
+    therefore carries its complete path; the search is a best-first
+    traversal of the feasible route tree. With ``allow_wait`` a route may
+    also stay at its current cell for one frame -- but only while the
+    frame it would occupy is still one of the provided frames (past the
+    last frame the last frame persists and no wait is generated), only
+    if that cell is free at the next frame, and at no extra cost: the
+    wait adds no entering-cell cost and no new coordinate, so the
+    no-revisit rule is untouched (a cell left can never be re-entered,
+    while consecutive waits may repeat the current coordinate). Goal
     closings are collected until the heap's smallest f exceeds the best
     goal cost, after which the minimum-cost goal tie-break is settled by
     the fixed f, h, x, y, t priority and then the complete path's
@@ -1020,6 +1108,19 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
                 (new_g + h, h, nx, ny, next_t, new_g, new_path,
                  seen | {nxt}),
             )
+        if allow_wait and next_t <= last_frame and (x, y) not in frame:
+            # Waiting in place: the route stays at its current cell for
+            # one frame. The wait is only generated while the frame it
+            # occupies is one of the provided frames (past the last frame
+            # the last frame persists but no wait is added), the cell
+            # must be free at that next frame, and the wait adds no
+            # entering-cell cost and no new coordinate, so ``seen`` is
+            # unchanged and the cost limit is unaffected.
+            h = heuristic((x, y))
+            heapq.heappush(
+                open_heap,
+                (g + h, h, x, y, next_t, g, path + ((x, y),), seen),
+            )
     if best_key is None:
         result = {"path": None, "cost": None, "expanded": closed_count}
         if has_status:
@@ -1041,13 +1142,14 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
             max_cost, closed_count, expanded_nodes,
             _tree_snapshot_state(open_heap, best_key, "plan",
                                  cost_limited, max_cost),
+            allow_wait,
         )
     return result
 
 
 def _search_any(width, height, obstacles, frames, start, goals, costs,
                 trace, max_expanded, max_cost=None, snapshot=False,
-                state=None):
+                allow_wait=False, state=None):
     """History-sensitive time-expanded A* over several candidate goals.
 
     This is the ``plan_any`` counterpart of ``_search_dynamic``. The only
@@ -1055,19 +1157,23 @@ def _search_any(width, height, obstacles, frames, start, goals, costs,
     distance to any candidate endpoint, and a closing at any goal
     coordinate is a goal closing that terminates the route. As in
     ``_search_dynamic`` the feasibility of a route depends on its exact
-    coordinate history (no waiting, no repeated coordinates, and dynamic
-    frames), so every node carries its complete path and routes reaching
-    the same cell through different histories are never merged; this is
-    also what makes the complete-path lexicographic tie-break exact.
-    Static mode is the same traversal with the time dimension fixed at 0
-    and no timed frames, so the trace records plain coordinate pairs
-    there, exactly as ``plan`` does. With ``max_cost`` a candidate route
-    whose accumulated entering-cell cost would exceed the limit is
-    discarded (``cost_limited`` records that any discard happened, so a
-    failure can be reported as ``cost_exhausted``; the flag is part of
-    the snapshot state). With ``snapshot=True`` a budget stop
-    additionally returns a checkpoint of the complete route-tree state;
-    ``state`` carries such a snapshot back in for ``resume``.
+    coordinate history (no repeated coordinates, dynamic frames, and no
+    waiting unless ``allow_wait`` is true), so every node carries its
+    complete path and routes reaching the same cell through different
+    histories are never merged; this is also what makes the
+    complete-path lexicographic tie-break exact. Static mode is the same
+    traversal with the time dimension fixed at 0 and no timed frames, so
+    the trace records plain coordinate pairs there, exactly as ``plan``
+    does. With ``allow_wait`` a dynamic route may stay at its current
+    cell for one frame under exactly ``_search_dynamic``'s rules (only
+    within the provided frames, only into a cell free at the next frame,
+    at no extra cost and with no new coordinate). With ``max_cost`` a
+    candidate route whose accumulated entering-cell cost would exceed
+    the limit is discarded (``cost_limited`` records that any discard
+    happened, so a failure can be reported as ``cost_exhausted``; the
+    flag is part of the snapshot state). With ``snapshot=True`` a budget
+    stop additionally returns a checkpoint of the complete route-tree
+    state; ``state`` carries such a snapshot back in for ``resume``.
     """
 
     def heuristic(point):
@@ -1166,6 +1272,16 @@ def _search_any(width, height, obstacles, frames, start, goals, costs,
                 (new_g + h, h, nx, ny, next_t, new_g, new_path,
                  seen | {nxt}),
             )
+        if (dynamic and allow_wait and next_t <= last_frame
+                and (x, y) not in frame):
+            # Waiting in place, exactly as in ``_search_dynamic``: only
+            # within the provided frames, only into a cell free at the
+            # next frame, at no extra cost and with no new coordinate.
+            h = heuristic((x, y))
+            heapq.heappush(
+                open_heap,
+                (g + h, h, x, y, next_t, g, path + ((x, y),), seen),
+            )
     if best_key is None:
         result = {"path": None, "cost": None, "expanded": closed_count}
         if has_status:
@@ -1187,13 +1303,14 @@ def _search_any(width, height, obstacles, frames, start, goals, costs,
             frames, max_cost, closed_count, expanded_nodes,
             _tree_snapshot_state(open_heap, best_key, "plan_any",
                                  cost_limited, max_cost),
+            allow_wait,
         )
     return result
 
 
 def _search_multi_static(width, height, obstacles, starts, goal, costs,
                          trace, max_expanded, max_cost=None, snapshot=False,
-                         state=None):
+                         allow_wait=False, state=None):
     """Multi-source static A* over the (cost, path) lexicographic objective.
 
     This is the ``plan_multi_start`` search without frames. Every start is
@@ -1327,30 +1444,35 @@ def _search_multi_static(width, height, obstacles, starts, goal, costs,
             max_cost, len(closed), expanded_nodes,
             _multi_static_snapshot_state(open_heap, best, closed,
                                          cost_limited, max_cost),
+            allow_wait,
         )
     return result
 
 
 def _search_multi_dynamic(width, height, obstacles, frames, starts, goal,
                           costs, trace, max_expanded, max_cost=None,
-                          snapshot=False, state=None):
+                          snapshot=False, allow_wait=False, state=None):
     """History-sensitive time-expanded multi-source A*.
 
     This is the ``plan_multi_start`` counterpart of ``_search_dynamic``:
     every start is a root at ``t == 0`` with ``g == 0`` and the same
-    route-tree rules apply (the persistent last frame, no waiting, no
-    repeated coordinates, and routes reaching the same ``(x, y, t)``
-    through different coordinate histories are distinct states that are
-    never merged). Goal closings are collected until the heap's smallest f
-    exceeds the best goal cost; the winner is the minimum-cost route, ties
-    decided by the complete coordinate path lexicographically. With
-    ``max_cost`` a candidate route whose accumulated entering-cell cost
-    would exceed the limit is discarded (``cost_limited`` records that any
-    discard happened, so a failure can be reported as ``cost_exhausted``;
-    the flag is part of the snapshot state). With ``snapshot=True`` a
-    budget stop additionally returns a checkpoint of the complete
-    route-tree state; ``state`` carries such a snapshot back in for
-    ``resume``.
+    route-tree rules apply (the persistent last frame, no repeated
+    coordinates, no waiting unless ``allow_wait`` is true, and routes
+    reaching the same ``(x, y, t)`` through different coordinate
+    histories are distinct states that are never merged). With
+    ``allow_wait`` a route may stay at its current cell for one frame
+    under exactly ``_search_dynamic``'s rules (only within the provided
+    frames, only into a cell free at the next frame, at no extra cost
+    and with no new coordinate). Goal closings are collected until the
+    heap's smallest f exceeds the best goal cost; the winner is the
+    minimum-cost route, ties decided by the complete coordinate path
+    lexicographically. With ``max_cost`` a candidate route whose
+    accumulated entering-cell cost would exceed the limit is discarded
+    (``cost_limited`` records that any discard happened, so a failure can
+    be reported as ``cost_exhausted``; the flag is part of the snapshot
+    state). With ``snapshot=True`` a budget stop additionally
+    returns a checkpoint of the complete route-tree state; ``state``
+    carries such a snapshot back in for ``resume``.
     """
 
     def heuristic(point):
@@ -1445,6 +1567,15 @@ def _search_multi_dynamic(width, height, obstacles, frames, starts, goal,
                 (new_g + h, h, nx, ny, next_t, new_g, new_path,
                  seen | {nxt}),
             )
+        if allow_wait and next_t <= last_frame and (x, y) not in frame:
+            # Waiting in place, exactly as in ``_search_dynamic``: only
+            # within the provided frames, only into a cell free at the
+            # next frame, at no extra cost and with no new coordinate.
+            h = heuristic((x, y))
+            heapq.heappush(
+                open_heap,
+                (g + h, h, x, y, next_t, g, path + ((x, y),), seen),
+            )
     if best_key is None:
         result = {"path": None, "cost": None, "expanded": closed_count}
         if has_status:
@@ -1466,22 +1597,27 @@ def _search_multi_dynamic(width, height, obstacles, frames, starts, goal,
             max_cost, closed_count, expanded_nodes,
             _multi_tree_snapshot_state(open_heap, best_key, cost_limited,
                                        max_cost),
+            allow_wait,
         )
     return result
 
 
 def _search_k(width, height, obstacles, frames, start, goal, costs, k,
-              max_expanded=None, max_cost=None):
+              max_expanded=None, max_cost=None, allow_wait=False):
     """Best-first traversal of the feasible route tree keeping the k best.
 
     This is the ``plan_k`` search. As in ``_search_dynamic`` and
     ``_search_any`` the feasibility of a route depends on its exact
-    coordinate history (no waiting, no repeated coordinates, and dynamic
-    frames), so every node carries its complete path and routes reaching
-    the same cell through different histories are never merged; this also
-    makes every complete coordinate sequence a distinct candidate and
-    keeps static-mode ordering consistent with ``plan``'s path
-    lexicographic tie-break.
+    coordinate history (no repeated coordinates, dynamic frames, and no
+    waiting unless ``allow_wait`` is true), so every node carries its
+    complete path and routes reaching the same cell through different
+    histories are never merged; this also makes every complete
+    coordinate sequence a distinct candidate and keeps static-mode
+    ordering consistent with ``plan``'s path lexicographic tie-break.
+    With ``allow_wait`` a dynamic route may stay at its current cell for
+    one frame under exactly ``_search_dynamic``'s rules (only within the
+    provided frames, only into a cell free at the next frame, at no
+    extra cost and with no new coordinate).
 
     Heap entries are ``(f, path, x, y, t, g, seen)``: the total priority
     is ``f`` first and then the complete coordinate path lexicographically,
@@ -1527,10 +1663,10 @@ def _search_k(width, height, obstacles, frames, start, goal, costs, k,
     def frame_cells(t):
         return frames[t] if t <= last_frame else frames[last_frame]
 
-    # ``path`` is unique per candidate (waiting and revisits are both
-    # forbidden), so ``(f, path)`` is already a total order and the later
-    # fields are never compared. The frozenset ``seen`` mirrors ``path``
-    # for an O(1) repeat check.
+    # ``path`` is unique per candidate (revisits are forbidden and even a
+    # wait extends the path with a new entry), so ``(f, path)`` is
+    # already a total order and the later fields are never compared. The
+    # frozenset ``seen`` mirrors ``path`` for an O(1) repeat check.
     h0 = heuristic(start)
     start_path = (start,)
     open_heap = [(h0, start_path, start[0], start[1], 0, 0,
@@ -1582,6 +1718,16 @@ def _search_k(width, height, obstacles, frames, start, goal, costs, k,
                 open_heap,
                 (new_g + h, new_path, nx, ny, next_t, new_g,
                  seen | {nxt}),
+            )
+        if (dynamic and allow_wait and next_t <= last_frame
+                and (x, y) not in frame):
+            # Waiting in place, exactly as in ``_search_dynamic``: only
+            # within the provided frames, only into a cell free at the
+            # next frame, at no extra cost and with no new coordinate.
+            h = heuristic((x, y))
+            heapq.heappush(
+                open_heap,
+                (g + h, path + ((x, y),), x, y, next_t, g, seen),
             )
     result = {"paths": found_paths, "costs": found_costs, "expanded": expanded}
     if has_status:
@@ -1750,13 +1896,14 @@ def _search_distance_field_any(width, height, obstacles, goals, costs,
 
 def _snapshot_checkpoint(planner, width, height, obstacles, start, endpoints,
                          costs, frames, max_cost, closed_count,
-                         expanded_nodes, state):
+                         expanded_nodes, state, allow_wait=False):
     # The checkpoint is built from JSON-native values only (ints, strings,
     # lists, dicts, ``None``) in one fixed key order, and every list
     # derived from a set is sorted, so neither set iteration order, goal
     # order nor in-frame coordinate order can influence the result. The
     # ``max_cost`` field is only present when a cost limit was provided,
-    # so checkpoints of calls that do not use it keep their exact
+    # and ``allow_wait`` is only recorded when waiting was enabled, so
+    # checkpoints of calls that do not use them keep their exact
     # previous shape.
     checkpoint = {
         "version": _SNAPSHOT_VERSION,
@@ -1780,6 +1927,8 @@ def _snapshot_checkpoint(planner, width, height, obstacles, start, endpoints,
     )
     if max_cost is not None:
         checkpoint["max_cost"] = max_cost
+    if allow_wait:
+        checkpoint["allow_wait"] = True
     checkpoint["closed"] = closed_count
     checkpoint["trace"] = [list(entry) for entry in expanded_nodes]
     checkpoint["state"] = state
@@ -1840,13 +1989,14 @@ def _tree_snapshot_state(open_heap, best_key, planner, cost_limited,
 
 def _snapshot_checkpoint_multi(width, height, obstacles, starts, goal, costs,
                                frames, max_cost, closed_count, expanded_nodes,
-                               state):
+                               state, allow_wait=False):
     # The ``plan_multi_start`` checkpoint: like ``_snapshot_checkpoint``
     # but with the sorted start tuple in place of the single start. Only
     # JSON-native values are used and every set-derived list is sorted, so
     # neither obstacle-set iteration order, start order nor in-frame
     # coordinate order can influence the result. The ``max_cost`` field is
-    # only present when a cost limit was provided.
+    # only present when a cost limit was provided, and ``allow_wait`` is
+    # only recorded when waiting was enabled.
     checkpoint = {
         "version": _SNAPSHOT_VERSION,
         "planner": "plan_multi_start",
@@ -1866,6 +2016,8 @@ def _snapshot_checkpoint_multi(width, height, obstacles, starts, goal, costs,
     )
     if max_cost is not None:
         checkpoint["max_cost"] = max_cost
+    if allow_wait:
+        checkpoint["allow_wait"] = True
     checkpoint["closed"] = closed_count
     checkpoint["trace"] = [list(entry) for entry in expanded_nodes]
     checkpoint["state"] = state
@@ -2200,7 +2352,7 @@ def _restore_static_state(raw, width, height, obstacles, start, goal,
 
 def _restore_tree_state(raw, planner, dynamic, width, height, obstacles,
                         frames, start, goal, goals, costs, closed_count,
-                        trace, max_cost):
+                        trace, max_cost, allow_wait):
     # Rebuild and fully cross-check a route-tree snapshot state (dynamic
     # ``plan``, and ``plan_any`` in both static and dynamic mode).
     if not isinstance(raw, dict):
@@ -2296,11 +2448,17 @@ def _restore_tree_state(raw, planner, dynamic, width, height, obstacles,
                 raise ValueError(
                     f"checkpoint candidate {cell} lies on a blocked cell"
                 )
-            if cell in seen:
+            # A consecutive repeat is only a legal wait when the search
+            # had waiting enabled, the mode is dynamic and the frame the
+            # wait occupies is one of the provided frames; every other
+            # repeat is inconsistent with the recorded constraints.
+            wait = (allow_wait and dynamic and previous == cell
+                    and index <= last_frame)
+            if cell in seen and not wait:
                 raise ValueError(
                     "checkpoint candidate path repeats a coordinate"
                 )
-            if previous is not None:
+            if previous is not None and not wait:
                 if (abs(cell[0] - previous[0])
                         + abs(cell[1] - previous[1])) != 1:
                     raise ValueError(
@@ -2569,7 +2727,8 @@ def _restore_multi_static_state(raw, width, height, obstacles, starts, goal,
 
 
 def _restore_multi_tree_state(raw, width, height, obstacles, frames, starts,
-                              goal, costs, closed_count, trace, max_cost):
+                              goal, costs, closed_count, trace, max_cost,
+                              allow_wait):
     # Rebuild and fully cross-check the multi-start route-tree snapshot
     # state (dynamic ``plan_multi_start``).
     if not isinstance(raw, dict):
@@ -2653,11 +2812,17 @@ def _restore_multi_tree_state(raw, width, height, obstacles, frames, starts,
                 raise ValueError(
                     f"checkpoint candidate {cell} lies on a blocked cell"
                 )
-            if cell in seen:
+            # A consecutive repeat is only a legal wait when the search
+            # had waiting enabled and the frame the wait occupies is one
+            # of the provided frames; every other repeat is inconsistent
+            # with the recorded constraints.
+            wait = (allow_wait and previous == cell
+                    and index <= last_frame)
+            if cell in seen and not wait:
                 raise ValueError(
                     "checkpoint candidate path repeats a coordinate"
                 )
-            if previous is not None:
+            if previous is not None and not wait:
                 if (abs(cell[0] - previous[0])
                         + abs(cell[1] - previous[1])) != 1:
                     raise ValueError(
@@ -2818,6 +2983,18 @@ def _restore_checkpoint(checkpoint):
                 f"checkpoint max_cost must be a non-negative integer, "
                 f"got {max_cost}"
             )
+    # The allow-wait flag is optional: checkpoints written before it
+    # existed (and checkpoints of searches without waiting) simply omit
+    # the field, which restores as ``False``. A present field must be a
+    # bool; a state that could not have been produced under the recorded
+    # flag (a wait without it, or a wait past the final frame) is
+    # rejected as inconsistent by the state restore below.
+    allow_wait = checkpoint.get("allow_wait", False)
+    if not isinstance(allow_wait, bool):
+        raise TypeError(
+            f"checkpoint allow_wait must be a bool, "
+            f"got {type(allow_wait).__name__}"
+        )
     closed_count = checkpoint["closed"]
     if not _is_int(closed_count):
         raise TypeError(
@@ -2861,7 +3038,8 @@ def _restore_checkpoint(checkpoint):
         if dynamic:
             state = _restore_multi_tree_state(
                 checkpoint["state"], width, height, obstacles, frames,
-                starts, goal, costs, closed_count, trace, max_cost
+                starts, goal, costs, closed_count, trace, max_cost,
+                allow_wait
             )
         else:
             state = _restore_multi_static_state(
@@ -2872,7 +3050,7 @@ def _restore_checkpoint(checkpoint):
         state = _restore_tree_state(
             checkpoint["state"], planner, dynamic, width, height,
             obstacles, frames, start, goal, goals, costs, closed_count,
-            trace, max_cost
+            trace, max_cost, allow_wait
         )
     return {
         "planner": planner,
@@ -2886,13 +3064,14 @@ def _restore_checkpoint(checkpoint):
         "costs": costs,
         "frames": frames,
         "max_cost": max_cost,
+        "allow_wait": allow_wait,
         "state": state,
     }
 
 
 def plan(width, height, blocked, start, goal, costs=None, trace=False,
          dynamic_blocked=None, max_expanded=None, snapshot=False,
-         max_cost=None):
+         max_cost=None, allow_wait=False):
     # --- Validation: everything is checked before the search begins. ---
     width = _validate_dimension(width, "width")
     height = _validate_dimension(height, "height")
@@ -2915,26 +3094,27 @@ def plan(width, height, blocked, start, goal, costs=None, trace=False,
         raise ValueError(
             f"start {start} is blocked at frame 0"
         )
-    # The budget is validated after every pre-existing check, then the
-    # snapshot flag, and the new cost limit is validated last of all,
-    # before the search starts.
+    # The allow-wait flag is validated after the dynamic_blocked checks
+    # (the frame-0 check included), then the budget, the snapshot flag,
+    # and the cost limit, all before the search starts.
+    _validate_allow_wait(allow_wait)
     _validate_budget(max_expanded)
     _validate_snapshot_flag(snapshot)
     _validate_max_cost(max_cost)
     if frames is not None:
         return _search_dynamic(
             width, height, obstacles, frames, start, goal, costs, trace,
-            max_expanded, max_cost, snapshot
+            max_expanded, max_cost, snapshot, allow_wait
         )
     return _search_static(
         width, height, obstacles, start, goal, costs, trace, max_expanded,
-        max_cost, snapshot
+        max_cost, snapshot, allow_wait
     )
 
 
 def plan_any(width, height, blocked, start, goals, costs=None, trace=False,
              dynamic_blocked=None, max_expanded=None, snapshot=False,
-             max_cost=None):
+             max_cost=None, allow_wait=False):
     # --- Validation: ``goals`` takes ``goal``'s exact position in       ---
     # --- ``plan``'s validation sequence; every shared check keeps its   ---
     # --- order, exception type and message boundary.                    ---
@@ -2961,21 +3141,22 @@ def plan_any(width, height, blocked, start, goals, costs=None, trace=False,
         raise ValueError(
             f"start {start} is blocked at frame 0"
         )
-    # The budget stays the last pre-existing check before the search,
-    # exactly as in ``plan``; the snapshot flag and then the new cost
-    # limit follow it.
+    # The allow-wait flag follows the dynamic_blocked checks; the budget
+    # stays the first of the limit checks before the search, exactly as
+    # in ``plan``; the snapshot flag and then the cost limit follow it.
+    _validate_allow_wait(allow_wait)
     _validate_budget(max_expanded)
     _validate_snapshot_flag(snapshot)
     _validate_max_cost(max_cost)
     return _search_any(
         width, height, obstacles, frames, start, goal_points, costs, trace,
-        max_expanded, max_cost, snapshot
+        max_expanded, max_cost, snapshot, allow_wait
     )
 
 
 def plan_batch(width, height, blocked, requests, costs=None, trace=False,
                dynamic_blocked=None, max_expanded=None, snapshot=False,
-               max_cost=None):
+               max_cost=None, allow_wait=False):
     # --- Validation: ``plan``'s shared checks in their usual order,    ---
     # --- with ``requests`` occupying the position of ``start``/``goal``---
     # --- in that sequence. Every check is decided before any search    ---
@@ -3009,8 +3190,10 @@ def plan_batch(width, height, blocked, requests, costs=None, trace=False,
                     f"requests[{index}] start {start} is blocked at "
                     f"frame 0"
                 )
-    # The budget, snapshot flag and cost limit keep ``plan``'s positions:
-    # after every grid and requests check and before any search starts.
+    # The allow-wait flag, budget, snapshot flag and cost limit keep
+    # ``plan``'s positions: after every grid and requests check and
+    # before any search starts.
+    _validate_allow_wait(allow_wait)
     _validate_budget(max_expanded)
     _validate_snapshot_flag(snapshot)
     _validate_max_cost(max_cost)
@@ -3024,19 +3207,19 @@ def plan_batch(width, height, blocked, requests, costs=None, trace=False,
         if frames is not None:
             results.append(_search_dynamic(
                 width, height, obstacles, frames, start, goal, costs,
-                trace, max_expanded, max_cost, snapshot
+                trace, max_expanded, max_cost, snapshot, allow_wait
             ))
         else:
             results.append(_search_static(
                 width, height, obstacles, start, goal, costs, trace,
-                max_expanded, max_cost, snapshot
+                max_expanded, max_cost, snapshot, allow_wait
             ))
     return {"results": results}
 
 
 def plan_multi_start(width, height, blocked, starts, goal, costs=None,
                      trace=False, dynamic_blocked=None, max_expanded=None,
-                     snapshot=False, max_cost=None):
+                     snapshot=False, max_cost=None, allow_wait=False):
     # --- Validation: ``starts`` takes ``start``'s exact position in     ---
     # --- ``plan``'s validation sequence; every shared check keeps its   ---
     # --- order, exception type and message boundary.                    ---
@@ -3063,29 +3246,34 @@ def plan_multi_start(width, height, blocked, starts, goal, costs=None,
         for point in start_points:
             if point in frames[0]:
                 raise ValueError(f"start {point} is blocked at frame 0")
-    # The budget, snapshot flag and cost limit keep ``plan``'s positions:
-    # after every grid and starts check and before any search starts.
+    # The allow-wait flag, budget, snapshot flag and cost limit keep
+    # ``plan``'s positions: after every grid and starts check and before
+    # any search starts.
+    _validate_allow_wait(allow_wait)
     _validate_budget(max_expanded)
     _validate_snapshot_flag(snapshot)
     _validate_max_cost(max_cost)
     if frames is not None:
         return _search_multi_dynamic(
             width, height, obstacles, frames, start_points, goal, costs,
-            trace, max_expanded, max_cost, snapshot
+            trace, max_expanded, max_cost, snapshot, allow_wait
         )
     return _search_multi_static(
         width, height, obstacles, start_points, goal, costs, trace,
-        max_expanded, max_cost, snapshot
+        max_expanded, max_cost, snapshot, allow_wait
     )
 
 
 def plan_k(width, height, blocked, start, goal, k, costs=None,
-           dynamic_blocked=None, max_expanded=None, max_cost=None):
+           dynamic_blocked=None, max_expanded=None, max_cost=None,
+           allow_wait=False):
     """Return up to ``k`` distinct routes ordered by priority.
 
     ``plan_k(width, height, blocked, start, goal, k, costs=None,
-    dynamic_blocked=None, max_expanded=None, max_cost=None)`` runs the
-    same grid/obstacle/costs/frame validation as ``plan`` first and then
+    dynamic_blocked=None, max_expanded=None, max_cost=None,
+    allow_wait=False)`` runs the
+    same grid/obstacle/costs/frame validation as ``plan`` first, then the
+    ``allow_wait`` flag (a non-bool value raises ``TypeError``), and then
     checks ``k``: it must be a positive, non-bool integer (wrong types
     raise ``TypeError`` and non-positive values raise ``ValueError``).
     The optional ``max_expanded`` and ``max_cost`` limits are validated
@@ -3095,8 +3283,9 @@ def plan_k(width, height, blocked, start, goal, k, costs=None,
     ``ValueError``), reusing ``plan``'s budget and cost-limit rules.
     Every error is decided before the search starts. The search keeps
     four-neighborhood moves, zero start cost, entering-cell cost
-    accumulation, the persistent last frame, no waiting and no repeated
-    coordinates; routes reaching the same cell through different
+    accumulation, the persistent last frame, no repeated coordinates and
+    -- unless ``allow_wait`` is enabled -- no waiting in place; routes
+    reaching the same cell through different
     coordinate histories are distinct candidates and are never merged.
 
     Returns ``{"paths": [...], "costs": [...], "expanded": int}`` with the
@@ -3144,6 +3333,9 @@ def plan_k(width, height, blocked, start, goal, k, costs=None,
     frames = _normalize_dynamic_blocked(dynamic_blocked, width, height)
     if frames is not None and start in frames[0]:
         raise ValueError(f"start {start} is blocked at frame 0")
+    # The allow-wait flag follows the dynamic_blocked checks and precedes
+    # every remaining check (the ``k`` check and the optional limits).
+    _validate_allow_wait(allow_wait)
     if not _is_int(k):
         raise TypeError(f"k must be an int, got {type(k).__name__}")
     if k <= 0:
@@ -3153,7 +3345,7 @@ def plan_k(width, height, blocked, start, goal, k, costs=None,
     _validate_budget(max_expanded)
     _validate_max_cost(max_cost)
     return _search_k(width, height, obstacles, frames, start, goal,
-                     costs, k, max_expanded, max_cost)
+                     costs, k, max_expanded, max_cost, allow_wait)
 
 
 def distance_field(width, height, blocked, goal, costs=None, trace=False):
@@ -3256,7 +3448,7 @@ def distance_field_any(width, height, blocked, goals, costs=None,
 
 
 def replay(width, height, blocked, start, goal, path, costs=None,
-           dynamic_blocked=None, diagnose=False):
+           dynamic_blocked=None, diagnose=False, allow_wait=False):
     # --- Validation: identical to ``plan`` and fully completed before ---
     # --- the candidate path is inspected or judged in any way.        ---
     width = _validate_dimension(width, "width")
@@ -3278,6 +3470,9 @@ def replay(width, height, blocked, start, goal, path, costs=None,
         raise TypeError(
             f"diagnose must be a bool, got {type(diagnose).__name__}"
         )
+    # The allow-wait flag follows the dynamic_blocked checks (and the
+    # diagnose flag) and is decided before the path is inspected.
+    _validate_allow_wait(allow_wait)
     points = _normalize_path(path, width, height)
 
     def step_cost(point):
@@ -3316,9 +3511,18 @@ def replay(width, height, blocked, start, goal, path, costs=None,
     total = 0
     previous = None
     for t, point in enumerate(points):
-        if point in seen:
+        # A wait is a consecutive repeat of the current cell, admissible
+        # only with ``allow_wait`` and dynamic frames, and only while the
+        # frame it occupies is one of the provided frames. It adds no
+        # entering-cell cost and no new coordinate.
+        wait = allow_wait and frames is not None and previous == point
+        if wait and t > last_frame:
+            # Past the last provided frame the last frame persists but no
+            # waiting is allowed.
+            return invalid("wait_after_final_frame", t)
+        if point in seen and not wait:
             return invalid("repeated_coordinate", t)  # second occurrence
-        if previous is not None:
+        if previous is not None and not wait:
             if (abs(point[0] - previous[0])
                     + abs(point[1] - previous[1])) != 1:
                 return invalid("non_adjacent", t)  # later point of the pair
@@ -3347,8 +3551,10 @@ def resume(checkpoint, max_expanded=None):
     # A resume always continues with the trace recorded (the checkpoint
     # carries it) and always snapshots again if the budget stops the
     # search once more. The checkpoint's cost limit (``None`` when the
-    # field is absent) keeps governing the search.
+    # field is absent) and its allow-wait flag (``False`` when absent)
+    # keep governing the search.
     max_cost = restored["max_cost"]
+    allow_wait = restored["allow_wait"]
     if restored["planner"] == "plan_multi_start":
         if restored["frames"] is None:
             return _search_multi_static(
@@ -3356,31 +3562,31 @@ def resume(checkpoint, max_expanded=None):
                 restored["obstacles"], restored["starts"],
                 restored["goal"], restored["costs"],
                 True, max_expanded, max_cost, snapshot=True,
-                state=restored["state"]
+                allow_wait=allow_wait, state=restored["state"]
             )
         return _search_multi_dynamic(
             restored["width"], restored["height"], restored["obstacles"],
             restored["frames"], restored["starts"], restored["goal"],
             restored["costs"], True, max_expanded, max_cost, snapshot=True,
-            state=restored["state"]
+            allow_wait=allow_wait, state=restored["state"]
         )
     if restored["planner"] == "plan" and restored["frames"] is None:
         return _search_static(
             restored["width"], restored["height"], restored["obstacles"],
             restored["start"], restored["goal"], restored["costs"],
             True, max_expanded, max_cost, snapshot=True,
-            state=restored["state"]
+            allow_wait=allow_wait, state=restored["state"]
         )
     if restored["planner"] == "plan":
         return _search_dynamic(
             restored["width"], restored["height"], restored["obstacles"],
             restored["frames"], restored["start"], restored["goal"],
             restored["costs"], True, max_expanded, max_cost, snapshot=True,
-            state=restored["state"]
+            allow_wait=allow_wait, state=restored["state"]
         )
     return _search_any(
         restored["width"], restored["height"], restored["obstacles"],
         restored["frames"], restored["start"], restored["goals"],
         restored["costs"], True, max_expanded, max_cost, snapshot=True,
-        state=restored["state"]
+        allow_wait=allow_wait, state=restored["state"]
     )

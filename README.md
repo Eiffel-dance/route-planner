@@ -55,6 +55,16 @@ Tests: python3 -m unittest discover -s tests -v
 - 每个查询都是一次独立的 `plan` 搜索：`path`、`cost`、`expanded` 按请求分别产生，`max_expanded` 预算与 `max_cost` 上限按查询各自生效，查询之间不共享任何搜索状态。`trace`、`status`、`expanded_nodes`、`checkpoint`、动态帧、`start == goal`、不可达与 `cost_exhausted` 的语义与 `plan` 完全一致；`budget_exhausted` 结果携带的 `checkpoint` 可直接交给 `resume` 继续。
 - 成功路径以其对应 `goal` 结尾，可逐条交给 `replay` 离线核验并得到相同代价与步数。重复障碍与帧内坐标合并，障碍集合或 `requests` 的排列不改变任何单条结果；整个返回对象可 JSON 序列化保存。
 
+`plan_multi_start(width, height, blocked, starts, goal, costs=None, trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None)` 在一次调用中从多个候选起点规划到同一终点，返回一条确定路线（返回结构与 `plan` 相同，`path` 以获胜起点开头、以 `goal` 结尾）；该路径可直接以首点为 `start`、末点为 `goal` 交给 `replay` 离线核验。
+
+**多起点（`starts`）**
+- 外层必须是非空序列：`None`、字符串、字节串或其他非序列抛 `TypeError`，空序列抛 `ValueError`。每个起点沿用坐标的结构和整数规则：元素形状或坐标类型不合格抛 `TypeError`，越界或落在静态障碍上抛 `ValueError`。`starts` 在 `plan` 校验序列中占据 `start` 的位置，网格、`costs`、`trace`、`dynamic_blocked`、预算、快照与代价上限的校验顺序及异常类型沿用 `plan`；动态第 0 帧阻塞任一起点同样抛 `ValueError`，全部检查先于搜索。
+- 重复起点合并并排序，输入排列（以及 `blocked`、帧内坐标的迭代顺序）不影响任何结果。
+- 静态模式把各起点作为 `g == 0` 的根且每个坐标只关闭一次；动态模式沿用持久化末帧、禁止等待和重复坐标，经不同历史到达同一 `(x, y, t)` 的路线是不同状态、互不剪枝。
+- 按总 `cost` 最小选路，同价按完整 `path` 字典序决定；扩展顺序固定为 f、h、`(x, y)`（动态再加 t）、最后按完整路径，因此结果不依赖起点输入顺序。`cost` 只算进入格子的代价（获胜起点为 0），`expanded` 只计关闭的候选，无路时 `path`/`cost` 为 `None`。
+- `trace=True` 时静态模式记录唯一坐标关闭序列、动态模式记录 `(x, y, t)` 关闭序列，且 `expanded == len(expanded_nodes)`。`starts` 含 `goal` 时按 `plan` 的 `start == goal` 单点零代价规则处理（零预算同样为 `budget_exhausted`）。
+- `max_expanded` 与 `max_cost` 沿用 `plan` 的 `status` 与预算优先规则：超代价候选丢弃且不计入 `expanded`，二者均不改变无上限路线与 tie-break。`snapshot=True` 因预算耗尽返回可 JSON 序列化的 `checkpoint`（记录排序后的 `starts`、网格约束、动态帧、提供时的代价上限与待处理状态），`resume` 按累计预算、不重复计数、仅再次预算耗尽才返回新 `checkpoint` 的规则继续搜索，非法 `checkpoint` 沿用 `resume` 既有的 `TypeError`/`ValueError` 边界。
+
 `distance_field(width, height, blocked, goal, costs=None, trace=False)` 与 `distance_field_any(width, height, blocked, goals, costs=None, trace=False)` 是面向静态栅格的离线分析入口：一次分析给出到单个或多个候选终点的最低代价场；不接受 `start`、`dynamic_blocked`、`max_expanded`、`max_cost`、`snapshot` 或其他控制参数，也不生成 `status`。
 
 **单终点代价场（`distance_field`）**

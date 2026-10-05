@@ -133,3 +133,10 @@ Tests: python3 -m unittest discover -s tests -v
 - 返回总代价最小的可行路径；总代价相同时，固定优先级依次为 f、h、x、y、t，仍相同时按完整坐标路径的字典序决定取舍，因此结果不依赖障碍集合、帧内坐标顺序或遍历顺序。
 - 动态模式下 `expanded_nodes` 按实际关闭顺序记录 `(x, y, t)` 三元组，`expanded` 按条目计数；被丢弃的候选不记录。同一 `(x, y, t)` 若由不同历史分别关闭，其三元组按关闭顺序分别出现，`expanded` 逐条计数。不可达时 `path`/`cost` 为 `None`。
 - 校验：外层必须是序列，每一帧必须是可迭代坐标集合；字符串/字节串、非二整数坐标抛出 `TypeError`，越界坐标抛出 `ValueError`，帧内重复坐标合并；`start` 在第 0 帧被禁止时抛出 `ValueError`。所有校验在搜索开始前完成，既有校验顺序不变。
+
+**按时间变化的代价图（`dynamic_costs`）**
+- `plan`、`plan_any` 与 `replay` 在末尾接受可选参数 `dynamic_costs=None`；省略、为 `None` 或为空序列时与未启用完全等价：所有返回键、异常边界、扩展顺序、路径选择与旧的 `costs` 语义保持不变，其他入口的签名不变。
+- 否则 `dynamic_costs` 必须是按时间排列的高度×宽度正整数矩阵序列，每帧一个矩阵且形状与网格一致。外层或某一帧不是可接受序列、单元格不是非布尔整数时抛 `TypeError`；行数或列数不符、代价非正、或同时提供 `costs` 与 `dynamic_costs` 时抛 `ValueError`。所有校验在全部既有校验之后、搜索开始前完成。
+- 启用后，路径在时间 `t`（即路径下标 `t`）进入坐标所付代价取第 `t` 帧该格数值；起点仍不计费，超过最后一帧后持续使用最后一帧。等待沿用既有规则（仅在提供的动态帧范围内生成）且不产生进入代价。规划在静态与动态障碍约束下返回全局最小总 `cost`；等价代价依旧按既有的终点与完整路径字典序裁决。`expanded` 与 `expanded_nodes` 只统计实际关闭的时空状态：不同历史不合并，不生成越界、障碍或非法重复节点；启用 `dynamic_costs` 后轨迹同样记录 `(x, y, t)` 三元组。
+- `max_cost` 按同一口径限制动态累计代价，沿用 `cost_exhausted` 与预算优先规则；`plan_any` 的获胜终点规则、`trace` 形态、`start == goal` 与不可达结果继续一致。`replay` 使用同一组帧代价重算 `cost`，合法路径的结果与规划一致；诊断错误类型与 `steps` 规则不变。
+- `snapshot=True` 产生的 checkpoint 以可 JSON 序列化结构保存 `dynamic_costs`（未提供时不新增该字段）、等待设置、累计状态与提供时的代价上限；`resume` 后的 `path`、`cost`、`expanded`、`status`、`trace` 及下一份 checkpoint 与一次不中断的调用逐项相同。`dynamic_costs` 相关的损坏快照分别报告 `TypeError` 或 `ValueError`，绝不静默降级。

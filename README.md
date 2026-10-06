@@ -55,6 +55,13 @@ Tests: python3 -m unittest discover -s tests -v
 - 每个查询都是一次独立的 `plan` 搜索：`path`、`cost`、`expanded` 按请求分别产生，`max_expanded` 预算与 `max_cost` 上限按查询各自生效，查询之间不共享任何搜索状态。`trace`、`status`、`expanded_nodes`、`checkpoint`、动态帧、`start == goal`、不可达与 `cost_exhausted` 的语义与 `plan` 完全一致；`budget_exhausted` 结果携带的 `checkpoint` 可直接交给 `resume` 继续。
 - 成功路径以其对应 `goal` 结尾，可逐条交给 `replay` 离线核验并得到相同代价与步数。重复障碍与帧内坐标合并，障碍集合或 `requests` 的排列不改变任何单条结果；整个返回对象可 JSON 序列化保存。
 
+`verify_batch_trace(width, height, blocked, requests, record, costs=None, dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None, allow_wait=False, dynamic_costs=None, reservations=None)` 是 `plan_batch` 结果的离线核验入口：审计 `trace=True` 批量调用保存或经 JSON 往返的返回对象，不要求调用方提供 `trace`，也不暴露重算过程。
+
+**批量离线核验（`verify_batch_trace`）**
+- 先按 `plan_batch` 的顺序完成共享参数与 `requests` 的结构、边界、障碍及动态第 0 帧检查（异常类型一致），再检查 `record`：`record` 必须是包含 `results` 的对象，否则抛 `TypeError`；`results` 必须与规范化后的 `requests` 等长，长度不符抛 `ValueError`。所有错误都在重算前确定。
+- `results` 的每项按 `verify_trace` 的单条记录规则校验：必须携带 `path`、`cost`、`expanded`、`expanded_nodes`；`path` 为坐标二元组，`expanded_nodes` 按静态或时空模式接受二元组或 `(x, y, t)` 三元组，JSON 列表同样接受且输入不被修改。结构或类型错误抛 `TypeError`；越界坐标、模式不符、负时间、静态搜索重复记录的状态及非法快照抛 `ValueError`。
+- 结构合法的记录不抛异常：按 `requests` 顺序独立重算每个 `plan` 结果并逐字段比较，返回 `{"valid", "request_index", "mismatch", "index"}`。完全一致的记录返回 `valid` 为真且其余三键为 `None`；否则报告最小请求下标及该请求内按 `path`、`cost`、`expanded`、`expanded_nodes`、`status`、`checkpoint` 固定顺序的首个差异字段，序列字段附带首个差异位置的零基下标，其余差异的 `index` 为 `None`。`status` 与 `checkpoint` 的缺失或多余按对应 `plan_batch` 结果是否应出现判定，其他记录键忽略；成功、不可达、预算或代价截断、动态等待、预约冲突与空路径结果都按独立 `plan` 的既有语义核验，返回值可 JSON 序列化。
+
 `plan_multi_start(width, height, blocked, starts, goal, costs=None, trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None)` 在一次调用中从多个候选起点规划到同一终点，返回一条确定路线（返回结构与 `plan` 相同，`path` 以获胜起点开头、以 `goal` 结尾）；该路径可直接以首点为 `start`、末点为 `goal` 交给 `replay` 离线核验。
 
 **多起点（`starts`）**

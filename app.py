@@ -25,6 +25,9 @@ dynamic_costs=None, reservations=None)``,
 trace=False)`` and
 ``verify_trace(width, height, blocked, start, goal, record, costs=None,
 dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None,
+allow_wait=False, dynamic_costs=None, reservations=None)`` and
+``verify_batch_trace(width, height, blocked, requests, record, costs=None,
+dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None,
 allow_wait=False, dynamic_costs=None, reservations=None)``.
 
 Semantics:
@@ -679,6 +682,55 @@ Offline audit (``verify_trace``):
   JSON-serializable, the record is never modified or completed, and no
   recomputed value leaks into it.
 
+Offline batch audit (``verify_batch_trace``):
+- ``verify_batch_trace(width, height, blocked, requests, record,
+  costs=None, dynamic_blocked=None, max_expanded=None, snapshot=False,
+  max_cost=None, allow_wait=False, dynamic_costs=None,
+  reservations=None)`` checks a saved ``plan_batch`` result against the
+  deterministic results the same arguments produce, without exposing
+  the recomputation. ``record`` may be the dict a ``trace=True``
+  ``plan_batch`` call returned or its JSON round-tripped equivalent:
+  coordinates may be lists or tuples, key order is irrelevant and extra
+  keys are ignored. The caller provides no ``trace`` flag; the audit
+  always recomputes with the trace on. The grid, requests, costs,
+  dynamic-frame, waiting, budget, snapshot, cost-limit, time-varying
+  cost and reservation arguments are validated first, in exactly
+  ``plan_batch``'s public order and with its exception types (structure,
+  bounds, obstacle and frame-0 checks included); only then is the
+  record inspected, so a missing or malformed record never skips a grid
+  or constraint error.
+- The record must be an object carrying ``results``; a non-object
+  record, a missing ``results`` field or a wrongly typed field raises
+  ``TypeError``. ``results`` must be a sequence with exactly one entry
+  per normalized request: a wrong length raises ``ValueError``. Every
+  entry is audited with ``verify_trace``'s per-record rules: it must
+  carry ``path``, ``cost``, ``expanded`` and ``expanded_nodes``;
+  ``path`` entries are coordinate pairs and ``expanded_nodes`` entries
+  are pairs in static mode or ``(x, y, t)`` triples in dynamic mode
+  (JSON lists are accepted and the input is never modified). Structure
+  or type failures raise ``TypeError``; out-of-bounds coordinates,
+  mode-inconsistent trajectory entries, negative times, states recorded
+  twice by a static search and invalid checkpoint structures raise
+  ``ValueError``. Every such check is decided before any audit search
+  starts.
+- A structurally legal record never raises: each request is recomputed
+  independently, in ``requests`` order, exactly as ``plan_batch``
+  answers it, and the entries are compared field by field. The report
+  is exactly ``{"valid": bool, "request_index": ..., "mismatch": ...,
+  "index": ...}``: the first differing request (smallest index) and,
+  within it, the first differing field in the fixed order ``path``,
+  ``cost``, ``expanded``, ``expanded_nodes``, ``status``,
+  ``checkpoint``; a path or trajectory difference also gives the
+  zero-based index of the first differing element, every other
+  difference reports ``index`` ``None``. A fully consistent record
+  returns ``valid`` true with ``request_index``, ``mismatch`` and
+  ``index`` all ``None``. Missing or extra ``status``/``checkpoint``
+  fields are judged by whether the corresponding ``plan_batch`` result
+  carries them; every other record key is ignored. Success,
+  unreachable, budget- and cost-truncated, waiting, reservation and
+  empty-path results all follow the independent ``plan`` semantics. The
+  result is JSON-serializable and the record is never modified.
+
 Validation (all performed before the search starts):
 - ``width``/``height`` must be positive integers.
 - ``start``, ``goal`` and every entry of ``blocked`` must be grid
@@ -717,7 +769,7 @@ from collections.abc import Iterable, Sequence
 __all__ = ["plan", "plan_any", "plan_k", "plan_batch", "plan_agents",
            "plan_multi_start",
            "replay", "resume", "distance_field", "distance_field_any",
-           "verify_trace", "verify_any_trace"]
+           "verify_trace", "verify_any_trace", "verify_batch_trace"]
 
 # Fixed neighbor generation order: +x, -x, +y, -y.
 _NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1))
@@ -4915,3 +4967,145 @@ def verify_any_trace(width, height, blocked, start, goals, record,
             != _canonical_json(result["checkpoint"])):
         return {"valid": False, "mismatch": "checkpoint", "index": None}
     return {"valid": True, "mismatch": None, "index": None}
+
+
+def _restore_batch_record(record, count, dynamic, width, height):
+    # Validate a saved ``plan_batch`` record for ``verify_batch_trace``
+    # and normalize every entry with ``verify_trace``'s per-record rules
+    # (each ``plan_batch`` entry is an independent ``plan`` result, so a
+    # static search closes every cell at most once). A non-object
+    # record, a missing ``results`` field or a wrongly typed ``results``
+    # value raises ``TypeError``; a ``results`` length that does not
+    # match the normalized requests raises ``ValueError``. Every check
+    # is decided here, before any audit search starts, and the record
+    # itself is never modified.
+    if not isinstance(record, dict):
+        raise TypeError(
+            f"record must be a plan_batch result object, "
+            f"got {type(record).__name__}"
+        )
+    if "results" not in record:
+        raise TypeError("record is missing required field 'results'")
+    raw = record["results"]
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+        raise TypeError(
+            f"record results must be a sequence of planning result "
+            f"objects, got {type(raw).__name__}"
+        )
+    if len(raw) != count:
+        raise ValueError(
+            f"record results must contain exactly {count} entries, "
+            f"got {len(raw)}"
+        )
+    return [
+        _restore_record(item, dynamic, width, height) for item in raw
+    ]
+
+
+def _audit_mismatch(saved, result):
+    # The first differing field between a normalized saved record and
+    # the recomputed result, in the fixed order ``path``, ``cost``,
+    # ``expanded``, ``expanded_nodes``, ``status``, ``checkpoint``;
+    # returns a (mismatch, index) pair, or (None, None) when the record
+    # is fully consistent. ``status`` and ``checkpoint`` are compared
+    # exactly when the recomputed result carries them.
+    index = _first_difference(saved["path"], result["path"])
+    if index is not None:
+        return "path", index
+    if saved["cost"] != result["cost"]:
+        return "cost", None
+    if saved["expanded"] != result["expanded"]:
+        return "expanded", None
+    index = _first_difference(saved["expanded_nodes"],
+                              result["expanded_nodes"])
+    if index is not None:
+        return "expanded_nodes", index
+    if "status" in result and saved["status"] != result["status"]:
+        return "status", None
+    if ("checkpoint" in result
+            and _canonical_json(saved["checkpoint"])
+            != _canonical_json(result["checkpoint"])):
+        return "checkpoint", None
+    return None, None
+
+
+def verify_batch_trace(width, height, blocked, requests, record, costs=None,
+                       dynamic_blocked=None, max_expanded=None, snapshot=False,
+                       max_cost=None, allow_wait=False, dynamic_costs=None,
+                       reservations=None):
+    # --- Validation: ``plan_batch``'s public checks in their exact    ---
+    # --- order (``requests`` takes the ``start``/``goal`` position;   ---
+    # --- only the never-present ``trace`` flag is skipped, since the  ---
+    # --- audit always recomputes with the trace on). The record is    ---
+    # --- inspected only after every shared and per-request check has  ---
+    # --- run, so a missing or malformed record never skips a grid or  ---
+    # --- requests error and a failed check never starts a search.     ---
+    width = _validate_dimension(width, "width")
+    height = _validate_dimension(height, "height")
+    pairs = _normalize_requests(requests)
+    for index, (start, goal) in enumerate(pairs):
+        _check_bounds(start, width, height, f"requests[{index}] start")
+        _check_bounds(goal, width, height, f"requests[{index}] goal")
+    obstacles = _normalize_blocked(blocked, width, height)
+    for index, (start, goal) in enumerate(pairs):
+        if start in obstacles:
+            raise ValueError(
+                f"requests[{index}] start {start} lies on a blocked cell"
+            )
+        if goal in obstacles:
+            raise ValueError(
+                f"requests[{index}] goal {goal} lies on a blocked cell"
+            )
+    costs = _normalize_costs(costs, width, height)
+    frames = _normalize_dynamic_blocked(dynamic_blocked, width, height)
+    if frames is not None:
+        for index, (start, _) in enumerate(pairs):
+            if start in frames[0]:
+                raise ValueError(
+                    f"requests[{index}] start {start} is blocked at "
+                    f"frame 0"
+                )
+    # The waiting flag, the budget, the snapshot flag, the cost limit,
+    # the time-varying cost frames and the reserved routes keep exactly
+    # ``plan_batch``'s positions; every check is decided before the
+    # record is inspected and before any audit search starts.
+    _validate_allow_wait(allow_wait)
+    _validate_budget(max_expanded)
+    _validate_snapshot_flag(snapshot)
+    _validate_max_cost(max_cost)
+    cost_frames = _normalize_dynamic_costs(dynamic_costs, width, height)
+    if cost_frames is not None and costs is not None:
+        raise ValueError(
+            "costs and dynamic_costs cannot both be provided"
+        )
+    reservation_paths = _normalize_reservations(
+        reservations, width, height, obstacles
+    )
+    dynamic = (frames is not None or cost_frames is not None
+               or reservation_paths is not None)
+    saved = _restore_batch_record(record, len(pairs), dynamic,
+                                  width, height)
+    # --- Audit: recompute each request independently, in ``requests`` ---
+    # --- order, exactly as ``plan_batch`` answers it, and compare the ---
+    # --- entries field by field. The first differing request (and,    ---
+    # --- within it, the first differing field) is reported; nothing   ---
+    # --- of the recomputation leaks into the record or the report.    ---
+    for request_index, ((start, goal), saved_item) in enumerate(
+            zip(pairs, saved)):
+        if dynamic:
+            result = _search_dynamic(
+                width, height, obstacles, frames, start, goal, costs,
+                True, max_expanded, max_cost, snapshot, allow_wait,
+                cost_frames=cost_frames, reservations=reservation_paths
+            )
+        else:
+            result = _search_static(
+                width, height, obstacles, start, goal, costs, True,
+                max_expanded, max_cost, snapshot, allow_wait
+            )
+        mismatch, index = _audit_mismatch(saved_item, result)
+        if mismatch is not None:
+            return {"valid": False, "request_index": request_index,
+                    "mismatch": mismatch, "index": index}
+    return {"valid": True, "request_index": None, "mismatch": None,
+            "index": None}

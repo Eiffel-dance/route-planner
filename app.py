@@ -13,6 +13,9 @@ allow_wait=False, dynamic_costs=None, reservations=None)``,
 ``plan_batch(width, height, blocked, requests, costs=None, trace=False,
 dynamic_blocked=None, max_expanded=None, snapshot=False,
 max_cost=None, allow_wait=False, dynamic_costs=None, reservations=None)``,
+``plan_agents(width, height, blocked, requests, costs=None, trace=False,
+dynamic_blocked=None, allow_wait=False, dynamic_costs=None,
+reservations=None)``,
 ``plan_multi_start(width, height, blocked, starts, goal, costs=None,
 trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False,
 max_cost=None, allow_wait=False, dynamic_costs=None, reservations=None)``,
@@ -420,6 +423,63 @@ Batch planning (``plan_batch``):
   never depends on obstacle-set iteration order, in-frame coordinate
   order or the permutation of ``requests``.
 
+Multi-agent planning (``plan_agents``):
+- ``plan_agents(width, height, blocked, requests, costs=None,
+  trace=False, dynamic_blocked=None, allow_wait=False,
+  dynamic_costs=None, reservations=None)`` plans conflict-free routes
+  for several agents on one shared grid in a single call: each request
+  is one agent's ``[start, goal]`` pair and the input order fixes the
+  planning priority. It accepts no ``max_expanded``, ``snapshot`` or
+  ``max_cost`` argument. Every other entry point keeps its signature
+  and, when ``plan_agents`` is never called, every return key,
+  exception, validation order, tie-break, trace and previous semantic
+  is untouched.
+- ``requests`` follows ``plan_batch``'s rules exactly: a non-empty
+  sequence (``None``, strings, bytes and other non-sequences raise
+  ``TypeError``, an empty sequence raises ``ValueError``) whose
+  elements are exactly two-coordinate ``[start, goal]`` pairs (element
+  shape or coordinate type failures raise ``TypeError``; out-of-bounds
+  coordinates, endpoints on static obstacles and a start blocked at
+  dynamic frame 0 raise ``ValueError``). Duplicate requests are kept
+  and each gets its own result. The dimensions, obstacles, ``costs``,
+  ``trace``, ``dynamic_blocked`` (frame-0 check included),
+  ``allow_wait``, ``dynamic_costs`` (providing both ``costs`` and
+  ``dynamic_costs`` raises ``ValueError``) and external
+  ``reservations`` checks keep ``plan_batch``'s relative order, and
+  every check is decided before any agent is searched, so an invalid
+  batch never returns partial results.
+- Agents are planned one at a time in request order. Each agent's
+  route is exactly the route ``plan`` would return for its pair with
+  the same shared arguments plus, appended to the external
+  ``reservations``, the complete timed routes of every earlier agent:
+  a later agent may not enter a vertex an earlier route occupies at
+  the same frame nor traverse the reverse of an earlier route's edge
+  between two frames, and each earlier route's final coordinate stays
+  reserved for every later frame. Four-neighborhood moves, the
+  entering-cell cost accumulation, the persistent last frame, waiting
+  (with ``allow_wait=True``), the consecutive-stay exception to the
+  no-repeated-coordinate rule and every tie-break follow ``plan`` and
+  ``replay`` exactly, in static and dynamic mode alike.
+- On full success the result is ``{"status": "found", "results":
+  [...], "expanded": int}``: ``results`` follows the request order
+  with one entry per request carrying ``path``, ``cost`` and
+  ``expanded`` (plus ``expanded_nodes`` when ``trace`` is true), and
+  the top-level ``expanded`` is the sum of the per-agent counts. The
+  first agent with no feasible route stops the batch immediately: the
+  result is ``{"status": "unreachable", "failed_index": int,
+  "results": [...], "expanded": int}`` where ``results`` holds the
+  already successful entries plus the failed one (its ``path`` and
+  ``cost`` are ``None``, its ``expanded`` still reports that agent's
+  closed count), later requests are never searched, the top-level
+  ``expanded`` counts only the agents actually attempted, and the
+  batch is never reported as found.
+- Every successful route verifies offline in ``replay`` with the same
+  shared arguments and the same ``cost`` and step count, and the
+  returned routes are mutually conflict-free: no two routes occupy the
+  same vertex at the same frame (goal occupancy persists past the
+  final coordinate) and no two routes traverse the same edge in
+  opposite directions between two frames.
+
 Multi-start planning (``plan_multi_start``):
 - ``plan_multi_start(width, height, blocked, starts, goal, costs=None,
   trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False,
@@ -643,20 +703,21 @@ Validation (all performed before the search starts):
 - ``goals`` (``plan_any`` and ``distance_field_any``) must be a
   non-empty sequence of grid coordinates following the same rules,
   normalized, deduplicated and order-independent.
-- ``requests`` (``plan_batch``) must be a non-empty sequence of
-  two-element ``[start, goal]`` coordinate pairs following the same
-  coordinate rules, with the input order and duplicates preserved.
+- ``requests`` (``plan_batch`` and ``plan_agents``) must be a non-empty
+  sequence of two-element ``[start, goal]`` coordinate pairs following
+  the same coordinate rules, with the input order and duplicates
+  preserved.
 - ``costs`` may be omitted or ``None`` (unit costs). Otherwise it must be a
   sequence of ``height`` rows, each a sequence of ``width`` positive
   integers; strings/bytes, non-integer cells and booleans are rejected.
 - ``dynamic_costs`` (``plan``, ``plan_any``, ``plan_batch``,
-  ``plan_multi_start``, ``plan_k`` and ``replay``) may be
+  ``plan_agents``, ``plan_multi_start``, ``plan_k`` and ``replay``) may be
   omitted, ``None`` or an empty sequence. Otherwise it must be a
   sequence of frames, each frame a height-by-width matrix following the
   ``costs`` rules per frame; providing both ``costs`` and
   ``dynamic_costs`` raises ``ValueError``.
 - ``reservations`` (``plan``, ``plan_any``, ``plan_batch``,
-  ``plan_multi_start``, ``plan_k`` and ``replay``) may be
+  ``plan_agents``, ``plan_multi_start``, ``plan_k`` and ``replay``) may be
   omitted, ``None`` or an empty sequence. Otherwise it must be a
   sequence of non-empty coordinate paths; consecutive stays are kept,
   duplicate routes merge and the entry order never affects the result.
@@ -670,8 +731,9 @@ Validation (all performed before the search starts):
 import heapq
 from collections.abc import Iterable, Sequence
 
-__all__ = ["plan", "plan_any", "plan_k", "plan_batch", "plan_multi_start",
-           "replay", "resume", "distance_field", "distance_field_any"]
+__all__ = ["plan", "plan_any", "plan_k", "plan_batch", "plan_agents",
+           "plan_multi_start", "replay", "resume", "distance_field",
+           "distance_field_any"]
 
 # Fixed neighbor generation order: +x, -x, +y, -y.
 _NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1))
@@ -3932,6 +3994,103 @@ def plan_batch(width, height, blocked, requests, costs=None, trace=False,
                 max_expanded, max_cost, snapshot, allow_wait
             ))
     return {"results": results}
+
+
+def plan_agents(width, height, blocked, requests, costs=None, trace=False,
+                dynamic_blocked=None, allow_wait=False, dynamic_costs=None,
+                reservations=None):
+    # --- Validation: ``plan_batch``'s shared checks in their usual     ---
+    # --- order, with ``requests`` occupying the position of            ---
+    # --- ``start``/``goal`` in that sequence. There is no budget,      ---
+    # --- snapshot or cost-limit argument; every check is decided       ---
+    # --- before any agent is searched, so an invalid batch never       ---
+    # --- returns partial results.                                      ---
+    width = _validate_dimension(width, "width")
+    height = _validate_dimension(height, "height")
+    pairs = _normalize_requests(requests)
+    for index, (start, goal) in enumerate(pairs):
+        _check_bounds(start, width, height, f"requests[{index}] start")
+        _check_bounds(goal, width, height, f"requests[{index}] goal")
+    obstacles = _normalize_blocked(blocked, width, height)
+    for index, (start, goal) in enumerate(pairs):
+        if start in obstacles:
+            raise ValueError(
+                f"requests[{index}] start {start} lies on a blocked cell"
+            )
+        if goal in obstacles:
+            raise ValueError(
+                f"requests[{index}] goal {goal} lies on a blocked cell"
+            )
+    costs = _normalize_costs(costs, width, height)
+    if not isinstance(trace, bool):
+        raise TypeError(
+            f"trace must be a bool, got {type(trace).__name__}"
+        )
+    frames = _normalize_dynamic_blocked(dynamic_blocked, width, height)
+    if frames is not None:
+        for index, (start, _) in enumerate(pairs):
+            if start in frames[0]:
+                raise ValueError(
+                    f"requests[{index}] start {start} is blocked at "
+                    f"frame 0"
+                )
+    # The waiting flag keeps ``plan``'s position right after the
+    # dynamic-frame checks; the time-varying cost frames follow every
+    # pre-existing check (providing both ``costs`` and ``dynamic_costs``
+    # is a ``ValueError``), and the external reserved routes come last,
+    # still before any agent is searched.
+    _validate_allow_wait(allow_wait)
+    cost_frames = _normalize_dynamic_costs(dynamic_costs, width, height)
+    if cost_frames is not None and costs is not None:
+        raise ValueError(
+            "costs and dynamic_costs cannot both be provided"
+        )
+    reservation_paths = _normalize_reservations(
+        reservations, width, height, obstacles
+    )
+    # Prioritized planning: agents are searched one at a time in request
+    # order (the input order fixes the priority, duplicates included).
+    # Each agent is exactly a ``plan`` search whose reservations are the
+    # external ones plus the complete timed routes of every earlier
+    # agent, so a later agent never enters a vertex an earlier route
+    # occupies at the same frame, never traverses the reverse of an
+    # earlier route's edge, and every earlier route's final coordinate
+    # stays reserved for all later frames.
+    planned = list(reservation_paths) if reservation_paths is not None else []
+    results = []
+    total_expanded = 0
+    for index, (start, goal) in enumerate(pairs):
+        active = tuple(planned) if planned else None
+        if (frames is not None or cost_frames is not None
+                or active is not None):
+            result = _search_dynamic(
+                width, height, obstacles, frames, start, goal, costs,
+                trace, None, None, False, allow_wait,
+                cost_frames=cost_frames, reservations=active
+            )
+        else:
+            result = _search_static(
+                width, height, obstacles, start, goal, costs, trace,
+                None, None, False, allow_wait
+            )
+        total_expanded += result["expanded"]
+        results.append(result)
+        if result["path"] is None:
+            # The first agent without a feasible route stops the batch
+            # immediately: later requests are never searched and the
+            # batch is never reported as found.
+            return {
+                "status": "unreachable",
+                "failed_index": index,
+                "results": results,
+                "expanded": total_expanded,
+            }
+        planned.append(tuple(result["path"]))
+    return {
+        "status": "found",
+        "results": results,
+        "expanded": total_expanded,
+    }
 
 
 def plan_multi_start(width, height, blocked, starts, goal, costs=None,

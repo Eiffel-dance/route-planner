@@ -55,6 +55,14 @@ Tests: python3 -m unittest discover -s tests -v
 - 每个查询都是一次独立的 `plan` 搜索：`path`、`cost`、`expanded` 按请求分别产生，`max_expanded` 预算与 `max_cost` 上限按查询各自生效，查询之间不共享任何搜索状态。`trace`、`status`、`expanded_nodes`、`checkpoint`、动态帧、`start == goal`、不可达与 `cost_exhausted` 的语义与 `plan` 完全一致；`budget_exhausted` 结果携带的 `checkpoint` 可直接交给 `resume` 继续。
 - 成功路径以其对应 `goal` 结尾，可逐条交给 `replay` 离线核验并得到相同代价与步数。重复障碍与帧内坐标合并，障碍集合或 `requests` 的排列不改变任何单条结果；整个返回对象可 JSON 序列化保存。
 
+`plan_agents(width, height, blocked, requests, costs=None, trace=False, dynamic_blocked=None, allow_wait=False, dynamic_costs=None, reservations=None)` 在一次调用中为多台代理在同一共享栅格上生成互不冲突的路线：`requests` 的每一项是一台代理的 `[start, goal]`，输入顺序即规划优先级；不接受 `max_expanded`、`snapshot` 或 `max_cost` 参数。
+
+**多代理规划（`plan_agents`）**
+- `requests` 沿用 `plan_batch` 的规则：必须是非空序列（`None`、字符串、字节串或其他非序列抛 `TypeError`，空序列抛 `ValueError`），每个元素恰好是 `[start, goal]` 两个坐标（元素形状或坐标类型错误抛 `TypeError`；越界、端点落在静态障碍上、动态第 0 帧阻塞某个起点抛 `ValueError`）。重复请求保留并各自作答。尺寸、`blocked`、`costs`、`trace`、`dynamic_blocked`（含第 0 帧检查）、`allow_wait`、`dynamic_costs`（同时提供 `costs` 与 `dynamic_costs` 抛 `ValueError`）与外部 `reservations` 的校验保持 `plan_batch` 的相对顺序，全部检查在任意代理被搜索之前完成，非法批次绝不返回部分结果。
+- 代理按请求顺序逐个规划：每台代理的路线恰等于以相同共享参数调用 `plan`、并在外部 `reservations` 之后追加所有先前代理完整时序路线时返回的路线。后续代理不得进入先前路线在同一时间帧占用的顶点，也不得沿先前路线边的反向通行；每条先前路线的终点坐标在之后所有帧持续被预约。四邻域移动、进入格子的代价累计、末帧持续、等待（`allow_wait=True`）、连续停留对禁止重复坐标的例外以及全部 tie-break 与 `plan`、`replay` 完全一致，静态与动态模式皆然。
+- 全部成功时返回 `{"status": "found", "results": [...], "expanded": int}`：`results` 按请求顺序每项携带 `path`、`cost`、`expanded`（`trace` 为真时附 `expanded_nodes`），顶层 `expanded` 为各代理计数之和。首个无可行路线的代理立即终止整批：返回 `{"status": "unreachable", "failed_index": int, "results": [...], "expanded": int}`，其中 `results` 含已成功项及失败项（其 `path`、`cost` 为 `None`，`expanded` 仍报告该代理的关闭数），后续请求不再搜索，顶层 `expanded` 只计实际尝试过的代理，整批绝不标记为成功。
+- 每条成功路线都可以相同共享参数交给 `replay` 离线核验并得到相同的 `cost` 与步数；返回的路线彼此无冲突：任意两条路线不会在同一帧占用同一顶点（终点占用持续），也不会在两帧之间沿同一条边反向对穿。
+
 `plan_multi_start(width, height, blocked, starts, goal, costs=None, trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None)` 在一次调用中从多个候选起点规划到同一终点，返回一条确定路线（返回结构与 `plan` 相同，`path` 以获胜起点开头、以 `goal` 结尾）；该路径可直接以首点为 `start`、末点为 `goal` 交给 `replay` 离线核验。
 
 **多起点（`starts`）**

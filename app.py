@@ -717,7 +717,7 @@ from collections.abc import Iterable, Sequence
 __all__ = ["plan", "plan_any", "plan_k", "plan_batch", "plan_agents",
            "plan_multi_start",
            "replay", "resume", "distance_field", "distance_field_any",
-           "verify_trace"]
+           "verify_trace", "verify_any_trace"]
 
 # Fixed neighbor generation order: +x, -x, +y, -y.
 _NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1))
@@ -4615,17 +4615,26 @@ def _normalize_record_entry(item, name):
     return tuple(item)
 
 
-def _restore_record(record, dynamic, width, height):
-    # Validate a saved planning record for ``verify_trace`` and normalize
-    # its coordinates to tuples. A record that is not an object, lacks a
+def _restore_record(record, dynamic, width, height, unique_static=True):
+    # Validate a saved planning record for ``verify_trace`` (and, with
+    # ``unique_static=False``, ``verify_any_trace``) and normalize its
+    # coordinates to tuples. A record that is not an object, lacks a
     # required field, has a wrongly typed field or a wrongly shaped
     # trajectory entry raises ``TypeError``; an out-of-bounds coordinate,
     # a trajectory entry inconsistent with the static/dynamic mode the
     # arguments select (a triple in static mode, a pair in dynamic mode,
-    # a negative time, or a state recorded twice by the static search,
-    # which closes each cell at most once) or an invalid checkpoint
-    # structure raises ``ValueError``. Everything is decided here, before
-    # the audit search starts. The record itself is never modified.
+    # a negative time, or--only when ``unique_static`` is set--a state
+    # recorded twice by a static search that closes each cell at most
+    # once) or an invalid checkpoint structure raises ``ValueError``.
+    # Everything is decided here, before the audit search starts. The
+    # record itself is never modified.
+    #
+    # ``plan_any``'s search is history sensitive even without timed
+    # frames: the same coordinate reached through a different path is a
+    # distinct route-tree node, so its static trace may legitimately
+    # record a coordinate more than once (``verify_any_trace`` therefore
+    # passes ``unique_static=False``). ``plan``'s static search closes
+    # every cell at most once, so a repeated pair is a malformed record.
     if not isinstance(record, dict):
         raise TypeError(
             f"record must be a planning result object, "
@@ -4688,7 +4697,7 @@ def _restore_record(record, dynamic, width, height):
                 raise ValueError(
                     f"{name} has a negative time {entry[2]}"
                 )
-        else:
+        elif unique_static:
             if entry in seen:
                 raise ValueError(
                     f"{name} records a state twice"
@@ -4803,6 +4812,90 @@ def verify_trace(width, height, blocked, start, goal, record, costs=None,
             width, height, obstacles, start, goal, costs, True,
             max_expanded, max_cost, snapshot, allow_wait
         )
+    index = _first_difference(saved["path"], result["path"])
+    if index is not None:
+        return {"valid": False, "mismatch": "path", "index": index}
+    if saved["cost"] != result["cost"]:
+        return {"valid": False, "mismatch": "cost", "index": None}
+    if saved["expanded"] != result["expanded"]:
+        return {"valid": False, "mismatch": "expanded", "index": None}
+    index = _first_difference(saved["expanded_nodes"],
+                              result["expanded_nodes"])
+    if index is not None:
+        return {"valid": False, "mismatch": "expanded_nodes",
+                "index": index}
+    if "status" in result and saved["status"] != result["status"]:
+        return {"valid": False, "mismatch": "status", "index": None}
+    if ("checkpoint" in result
+            and _canonical_json(saved["checkpoint"])
+            != _canonical_json(result["checkpoint"])):
+        return {"valid": False, "mismatch": "checkpoint", "index": None}
+    return {"valid": True, "mismatch": None, "index": None}
+
+
+def verify_any_trace(width, height, blocked, start, goals, record,
+                     costs=None, dynamic_blocked=None, max_expanded=None,
+                     snapshot=False, max_cost=None, allow_wait=False,
+                     dynamic_costs=None, reservations=None):
+    # --- Validation: ``plan_any``'s public checks in their exact order  ---
+    # --- (``goals`` takes ``goal``'s position; only the never-present   ---
+    # --- ``trace`` flag is skipped, since the audit always recomputes   ---
+    # --- with the trace on). The record is inspected only after every   ---
+    # --- grid and constraint check has run, so a missing or malformed   ---
+    # --- record never skips a grid or goals error and a failed check    ---
+    # --- never starts a search or returns a partial report.             ---
+    width = _validate_dimension(width, "width")
+    height = _validate_dimension(height, "height")
+    start = _normalize_point(start, "start")
+    goal_points = _normalize_goals(goals)
+    _check_bounds(start, width, height, "start")
+    for point in goal_points:
+        _check_bounds(point, width, height, "goal")
+    obstacles = _normalize_blocked(blocked, width, height)
+    if start in obstacles:
+        raise ValueError(f"start {start} lies on a blocked cell")
+    for point in goal_points:
+        if point in obstacles:
+            raise ValueError(f"goal {point} lies on a blocked cell")
+    costs = _normalize_costs(costs, width, height)
+    frames = _normalize_dynamic_blocked(dynamic_blocked, width, height)
+    if frames is not None and start in frames[0]:
+        raise ValueError(
+            f"start {start} is blocked at frame 0"
+        )
+    # The waiting flag, the budget, the snapshot flag, the cost limit,
+    # the time-varying cost frames and the reserved routes keep exactly
+    # ``plan_any``'s positions; every check is decided before the record
+    # is inspected and before the audit search starts.
+    _validate_allow_wait(allow_wait)
+    _validate_budget(max_expanded)
+    _validate_snapshot_flag(snapshot)
+    _validate_max_cost(max_cost)
+    cost_frames = _normalize_dynamic_costs(dynamic_costs, width, height)
+    if cost_frames is not None and costs is not None:
+        raise ValueError(
+            "costs and dynamic_costs cannot both be provided"
+        )
+    reservation_paths = _normalize_reservations(
+        reservations, width, height, obstacles
+    )
+    dynamic = (frames is not None or cost_frames is not None
+               or reservation_paths is not None)
+    # ``plan_any``'s route-tree search closes a coordinate through each
+    # distinct history even in static mode, so a repeated pair in the
+    # recorded trace is not a malformed record (unlike ``verify_trace``).
+    saved = _restore_record(record, dynamic, width, height,
+                            unique_static=False)
+    # --- Audit: recompute the deterministic multi-goal result with the  ---
+    # --- trace on and compare field by field in the fixed order. Lists  ---
+    # --- and tuples compare equal (JSON round trips), extra record      ---
+    # --- fields are ignored, and nothing of the recomputation or the    ---
+    # --- comparison modifies the record.                                ---
+    result = _search_any(
+        width, height, obstacles, frames, start, goal_points, costs, True,
+        max_expanded, max_cost, snapshot, allow_wait,
+        cost_frames=cost_frames, reservations=reservation_paths
+    )
     index = _first_difference(saved["path"], result["path"])
     if index is not None:
         return {"valid": False, "mismatch": "path", "index": index}

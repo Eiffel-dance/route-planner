@@ -2,23 +2,23 @@
 
 Public entry points: ``plan(width, height, blocked, start, goal, costs=None,
 trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False,
-max_cost=None, allow_wait=False, dynamic_costs=None)``,
+max_cost=None, allow_wait=False, dynamic_costs=None, reservations=None)``,
 ``plan_any(width, height, blocked,
 start, goals, costs=None, trace=False, dynamic_blocked=None,
 max_expanded=None, snapshot=False, max_cost=None, allow_wait=False,
-dynamic_costs=None)``,
+dynamic_costs=None, reservations=None)``,
 ``plan_k(width, height, blocked, start, goal, k, costs=None,
 dynamic_blocked=None, max_expanded=None, max_cost=None,
-allow_wait=False, dynamic_costs=None)``,
+allow_wait=False, dynamic_costs=None, reservations=None)``,
 ``plan_batch(width, height, blocked, requests, costs=None, trace=False,
 dynamic_blocked=None, max_expanded=None, snapshot=False,
-max_cost=None, allow_wait=False, dynamic_costs=None)``,
+max_cost=None, allow_wait=False, dynamic_costs=None, reservations=None)``,
 ``plan_multi_start(width, height, blocked, starts, goal, costs=None,
 trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False,
-max_cost=None, allow_wait=False, dynamic_costs=None)``,
+max_cost=None, allow_wait=False, dynamic_costs=None, reservations=None)``,
 ``replay(width, height, blocked, start, goal, path, costs=None,
 dynamic_blocked=None, diagnose=False, allow_wait=False,
-dynamic_costs=None)``,
+dynamic_costs=None, reservations=None)``,
 ``resume(checkpoint, max_expanded=None)``,
 ``distance_field(width, height, blocked, goal, costs=None, trace=False)``
 and
@@ -224,6 +224,56 @@ Time-varying costs (``dynamic_costs``):
   checkpoint whose ``dynamic_costs`` is corrupt raises ``TypeError`` or
   ``ValueError`` and never silently degrades. ``plan_k`` accepts no
   snapshot option.
+
+Reserved space-time routes (``reservations``):
+- ``plan``, ``plan_any``, ``plan_batch``, ``plan_multi_start``,
+  ``plan_k`` and ``replay`` accept a final optional
+  ``reservations=None`` parameter. Omitting it, passing ``None`` or an
+  empty sequence keeps every result key, value, exception type,
+  validation order, expansion order and tie-break of the previous
+  behavior untouched; existing calls need no migration.
+- Otherwise ``reservations`` must be a sequence of non-empty coordinate
+  paths, each the timed route another agent already occupies. An outer
+  value or path that is not an acceptable sequence, or a coordinate
+  that is not exactly two non-bool integers, raises ``TypeError``; an
+  empty path, an out-of-bounds coordinate, a coordinate on a static
+  obstacle or a coordinate repeated non-consecutively inside one path
+  raises ``ValueError``. Consecutive stays inside a path are kept,
+  duplicate routes merge and the input order of the routes never
+  influences any result. All checks run after every pre-existing
+  validation (in ``plan_batch`` before any request is searched) and
+  before the search starts.
+- A route's coordinate at index ``t`` occupies that vertex at frame
+  ``t``; past its final frame the route keeps occupying its last
+  coordinate. Adjacent coordinates form the directed edge of that
+  frame. A candidate route may not enter a reserved vertex at the same
+  frame and may not traverse the reverse of a reserved edge; the start
+  cell itself is never checked. The candidate route remains subject to
+  the static obstacles, ``dynamic_blocked``, ``costs`` and
+  ``dynamic_costs`` exactly as before.
+- Reservations make the search time-expanded exactly like dynamic
+  frames: ``expanded`` counts only actually closed space-time states
+  and the trace records ``(x, y, t)`` triples; the winning route is
+  decided by total cost, arrival steps and the complete coordinate
+  sequence, and an unreachable query keeps returning the usual
+  empty-path result. With ``allow_wait=True`` a route may wait in place
+  while its cell is safe at the next frame, waits add no entering-cell
+  cost, and waits are only generated while the next frame still lies
+  within the provided time frames (the dynamic frames and the
+  reservation frames, whichever reach further); once a cell is left it
+  may never be re-entered.
+- ``max_expanded``, ``max_cost``, ``plan_k``, ``plan_batch`` and
+  ``plan_multi_start`` keep their respective ``status``, truncation and
+  independent-query semantics. Checkpoints record the normalized
+  reservations (the field is omitted when none were provided) and a
+  resumed search matches one uninterrupted call field by field; a
+  corrupt reservations field raises ``TypeError`` or ``ValueError``.
+- ``replay`` re-checks a candidate path under the same reservations: a
+  reserved vertex at the arrival frame or a traversed reverse reserved
+  edge makes the path invalid, and with ``diagnose=True`` they report
+  the dedicated errors ``reservation_vertex`` and ``reservation_edge``
+  with the zero-based index of the first offending element; every other
+  invalid path keeps the existing fixed structure.
 
 Multi-goal planning (``plan_any``):
 - ``plan_any(width, height, blocked, start, goals, ...)`` accepts the same
@@ -809,6 +859,114 @@ def _normalize_dynamic_blocked(dynamic_blocked, width, height):
     return frames
 
 
+def _normalize_reservations(reservations, width, height, obstacles):
+    # ``reservations`` is the multi-robot coordination input: a sequence
+    # of non-empty coordinate paths, each the timed route another agent
+    # already occupies. ``None`` or an empty sequence disables it
+    # (equivalent to not provided). The outer value and every path must
+    # be sequences (strings/bytes and other non-sequences raise
+    # ``TypeError``); a coordinate that is not exactly two non-bool
+    # integers raises ``TypeError``; an empty path, an out-of-bounds
+    # coordinate, a coordinate on a static obstacle or a coordinate
+    # repeated non-consecutively inside one path raises ``ValueError``.
+    # Consecutive stays inside a path are kept, duplicate routes merge
+    # and the tuple is sorted, so neither the input order of the routes
+    # nor duplicates influence any result. All checks run before the
+    # search starts.
+    if reservations is None:
+        return None  # reservations disabled
+    if isinstance(reservations, (str, bytes)) or not isinstance(
+        reservations, Sequence
+    ):
+        raise TypeError(
+            f"reservations must be a sequence of coordinate paths, "
+            f"got {type(reservations).__name__}"
+        )
+    if len(reservations) == 0:
+        return None  # no routes: equivalent to not provided
+    routes = set()
+    for index, raw in enumerate(reservations):
+        name = f"reservations[{index}]"
+        if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+            raise TypeError(
+                f"{name} must be a sequence of grid coordinates, "
+                f"got {type(raw).__name__}"
+            )
+        if len(raw) == 0:
+            raise ValueError(f"{name} must be a non-empty coordinate path")
+        points = []
+        seen = set()
+        previous = None
+        for offset, item in enumerate(raw):
+            point = _normalize_point(item, f"{name}[{offset}]")
+            _check_bounds(point, width, height, f"{name}[{offset}]")
+            if point in obstacles:
+                raise ValueError(
+                    f"{name}[{offset}] {point} lies on a blocked cell"
+                )
+            if point != previous:
+                # A consecutive stay is kept; re-entering a coordinate
+                # the route already left is rejected.
+                if point in seen:
+                    raise ValueError(
+                        f"{name} revisits {point} non-consecutively"
+                    )
+                seen.add(point)
+            points.append(point)
+            previous = point
+        routes.add(tuple(points))  # duplicate routes merge
+    return tuple(sorted(routes))
+
+
+def _reservation_tables(routes):
+    # Precompute the per-frame lookup tables for normalized reservation
+    # routes: ``vertex_frames[t]`` holds the vertices occupied at frame
+    # ``t`` (a route keeps occupying its last coordinate past its final
+    # frame, so later frames clamp to the last one) and
+    # ``edge_frames[t]`` holds the directed edges the routes traverse
+    # between frames ``t`` and ``t + 1`` (a parked route forms no edge).
+    last = max(len(route) for route in routes) - 1
+    vertex_frames = []
+    for t in range(last + 1):
+        vertex_frames.append(frozenset(
+            route[t] if t < len(route) else route[-1]
+            for route in routes
+        ))
+    edge_frames = []
+    for t in range(last):
+        edge_frames.append(frozenset(
+            (route[t], route[t + 1])
+            for route in routes
+            if t + 1 < len(route)
+        ))
+    return vertex_frames, edge_frames
+
+
+def _reservation_checks(reservations):
+    # Build the conflict predicates a search needs from normalized
+    # reservation routes, plus the frame horizon the routes provide for
+    # waiting. With no reservations both predicates always fail and the
+    # horizon is ``None``.
+    if reservations is None:
+        return (lambda cell, t: False), (lambda frm, to, t: False), None
+    vertex_frames, edge_frames = _reservation_tables(reservations)
+    vertex_last = len(vertex_frames) - 1
+    edge_last = len(edge_frames) - 1
+
+    def vertex_conflict(cell, t):
+        # ``cell`` is occupied at frame ``t``; frames past the last one
+        # reuse it (the final coordinates stay occupied).
+        return cell in vertex_frames[t if t <= vertex_last else vertex_last]
+
+    def edge_conflict(frm, to, t):
+        # A candidate traversing ``frm -> to`` between frames ``t`` and
+        # ``t + 1`` conflicts with a reserved edge ``to -> frm`` at
+        # frame ``t``.
+        return t <= edge_last and (to, frm) in edge_frames[t]
+
+    return vertex_conflict, edge_conflict, vertex_last
+
+
 def _normalize_path(path, width, height):
     if (path is None or isinstance(path, (str, bytes))
             or not isinstance(path, Sequence)):
@@ -1100,7 +1258,8 @@ def _search_static(width, height, obstacles, start, goal, costs, trace,
 
 def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
                     trace, max_expanded, max_cost=None, snapshot=False,
-                    allow_wait=False, state=None, cost_frames=None):
+                    allow_wait=False, state=None, cost_frames=None,
+                    reservations=None):
     """History-sensitive time-expanded A*.
 
     Frame ``t`` constrains the cell occupied at path index ``t``; frames
@@ -1158,6 +1317,19 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
         if frames is None:
             return frozenset()
         return frames[t] if t <= last_frame else frames[last_frame]
+
+    # Reserved space-time routes: a candidate may not enter a reserved
+    # vertex at the arrival frame nor traverse the reverse of a reserved
+    # edge. The routes also provide time frames of their own, so the
+    # wait horizon extends to whichever of the dynamic frames and the
+    # reservation frames reaches further.
+    vertex_conflict, edge_conflict, res_horizon = _reservation_checks(
+        reservations
+    )
+    wait_horizon = last_frame if frames is not None else None
+    if res_horizon is not None:
+        wait_horizon = (res_horizon if wait_horizon is None
+                        else max(wait_horizon, res_horizon))
 
     # Heap entries are (f, h, x, y, t, g, path, seen): f/h/x/y/t give the
     # fixed numeric priority and candidates still tied are ordered by the
@@ -1220,6 +1392,8 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
             nxt = (nx, ny)
             if nxt in obstacles or nxt in frame or nxt in seen:
                 continue  # static obstacle, timed obstacle, or revisit
+            if vertex_conflict(nxt, next_t) or edge_conflict((x, y), nxt, t):
+                continue  # reserved vertex or reversed reserved edge
             new_g = g + step_cost(nxt, next_t)
             if max_cost is not None and new_g > max_cost:
                 # The candidate's accumulated cost exceeds the limit:
@@ -1233,8 +1407,9 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
                 (new_g + h, h, nx, ny, next_t, new_g, new_path,
                  seen | {nxt}),
             )
-        if (allow_wait and frames is not None and next_t <= last_frame
-                and (x, y) not in frame):
+        if (allow_wait and wait_horizon is not None
+                and next_t <= wait_horizon and (x, y) not in frame
+                and not vertex_conflict((x, y), next_t)):
             # Waiting in place: the route stays one more frame at no
             # entering-cell cost. Only generated while the next time step
             # still lies within the provided frames (after the last frame
@@ -1268,14 +1443,15 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
             max_cost, closed_count, expanded_nodes,
             _tree_snapshot_state(open_heap, best_key, "plan",
                                  cost_limited, max_cost),
-            allow_wait, cost_frames,
+            allow_wait, cost_frames, reservations,
         )
     return result
 
 
 def _search_any(width, height, obstacles, frames, start, goals, costs,
                 trace, max_expanded, max_cost=None, snapshot=False,
-                allow_wait=False, state=None, cost_frames=None):
+                allow_wait=False, state=None, cost_frames=None,
+                reservations=None):
     """History-sensitive time-expanded A* over several candidate goals.
 
     This is the ``plan_any`` counterpart of ``_search_dynamic``. The only
@@ -1311,7 +1487,8 @@ def _search_any(width, height, obstacles, frames, start, goals, costs,
             for goal in goals
         )
 
-    dynamic = frames is not None or cost_frames is not None
+    dynamic = (frames is not None or cost_frames is not None
+               or reservations is not None)
     last_frame = len(frames) - 1 if frames is not None else None
     last_cost_frame = len(cost_frames) - 1 if cost_frames is not None else None
 
@@ -1332,6 +1509,19 @@ def _search_any(width, height, obstacles, frames, start, goals, costs,
         if frames is None:
             return frozenset()
         return frames[t] if t <= last_frame else frames[last_frame]
+
+    # Reserved space-time routes: a candidate may not enter a reserved
+    # vertex at the arrival frame nor traverse the reverse of a reserved
+    # edge. The routes also provide time frames of their own, so the
+    # wait horizon extends to whichever of the dynamic frames and the
+    # reservation frames reaches further.
+    vertex_conflict, edge_conflict, res_horizon = _reservation_checks(
+        reservations
+    )
+    wait_horizon = last_frame if frames is not None else None
+    if res_horizon is not None:
+        wait_horizon = (res_horizon if wait_horizon is None
+                        else max(wait_horizon, res_horizon))
 
     # Heap entries are (f, h, x, y, t, g, path, seen), keyed exactly like
     # ``_search_dynamic``: the fixed numeric priority comes first and
@@ -1399,6 +1589,8 @@ def _search_any(width, height, obstacles, frames, start, goals, costs,
             nxt = (nx, ny)
             if nxt in obstacles or nxt in frame or nxt in seen:
                 continue  # static obstacle, timed obstacle, or revisit
+            if vertex_conflict(nxt, next_t) or edge_conflict((x, y), nxt, t):
+                continue  # reserved vertex or reversed reserved edge
             new_g = g + step_cost(nxt, next_t)
             if max_cost is not None and new_g > max_cost:
                 # The candidate's accumulated cost exceeds the limit:
@@ -1412,8 +1604,9 @@ def _search_any(width, height, obstacles, frames, start, goals, costs,
                 (new_g + h, h, nx, ny, next_t, new_g, new_path,
                  seen | {nxt}),
             )
-        if (allow_wait and frames is not None and next_t <= last_frame
-                and cell not in frame):
+        if (allow_wait and wait_horizon is not None
+                and next_t <= wait_horizon and cell not in frame
+                and not vertex_conflict(cell, next_t)):
             # Waiting in place: one more frame at no entering-cell cost,
             # only within the provided frames and while the cell itself
             # is free at the next frame. The coordinate is already in
@@ -1445,7 +1638,7 @@ def _search_any(width, height, obstacles, frames, start, goals, costs,
             frames, max_cost, closed_count, expanded_nodes,
             _tree_snapshot_state(open_heap, best_key, "plan_any",
                                  cost_limited, max_cost),
-            allow_wait, cost_frames,
+            allow_wait, cost_frames, reservations,
         )
     return result
 
@@ -1594,7 +1787,7 @@ def _search_multi_static(width, height, obstacles, starts, goal, costs,
 def _search_multi_dynamic(width, height, obstacles, frames, starts, goal,
                           costs, trace, max_expanded, max_cost=None,
                           snapshot=False, allow_wait=False, state=None,
-                          cost_frames=None):
+                          cost_frames=None, reservations=None):
     """History-sensitive time-expanded multi-source A*.
 
     This is the ``plan_multi_start`` counterpart of ``_search_dynamic``:
@@ -1649,6 +1842,19 @@ def _search_multi_dynamic(width, height, obstacles, frames, starts, goal,
         if frames is None:
             return frozenset()
         return frames[t] if t <= last_frame else frames[last_frame]
+
+    # Reserved space-time routes: a candidate may not enter a reserved
+    # vertex at the arrival frame nor traverse the reverse of a reserved
+    # edge. The routes also provide time frames of their own, so the
+    # wait horizon extends to whichever of the dynamic frames and the
+    # reservation frames reaches further.
+    vertex_conflict, edge_conflict, res_horizon = _reservation_checks(
+        reservations
+    )
+    wait_horizon = last_frame if frames is not None else None
+    if res_horizon is not None:
+        wait_horizon = (res_horizon if wait_horizon is None
+                        else max(wait_horizon, res_horizon))
 
     # Heap entries are (f, h, x, y, t, g, path, seen), keyed exactly like
     # ``_search_dynamic``: the fixed numeric priority comes first and
@@ -1715,6 +1921,8 @@ def _search_multi_dynamic(width, height, obstacles, frames, starts, goal,
             nxt = (nx, ny)
             if nxt in obstacles or nxt in frame or nxt in seen:
                 continue  # static obstacle, timed obstacle, or revisit
+            if vertex_conflict(nxt, next_t) or edge_conflict((x, y), nxt, t):
+                continue  # reserved vertex or reversed reserved edge
             new_g = g + step_cost(nxt, next_t)
             if max_cost is not None and new_g > max_cost:
                 # The candidate's accumulated cost exceeds the limit:
@@ -1728,8 +1936,9 @@ def _search_multi_dynamic(width, height, obstacles, frames, starts, goal,
                 (new_g + h, h, nx, ny, next_t, new_g, new_path,
                  seen | {nxt}),
             )
-        if (allow_wait and frames is not None and next_t <= last_frame
-                and (x, y) not in frame):
+        if (allow_wait and wait_horizon is not None
+                and next_t <= wait_horizon and (x, y) not in frame
+                and not vertex_conflict((x, y), next_t)):
             # Waiting in place: one more frame at no entering-cell cost,
             # only within the provided frames and while the cell itself
             # is free at the next frame. The coordinate is already in
@@ -1761,14 +1970,14 @@ def _search_multi_dynamic(width, height, obstacles, frames, starts, goal,
             max_cost, closed_count, expanded_nodes,
             _multi_tree_snapshot_state(open_heap, best_key, cost_limited,
                                        max_cost),
-            allow_wait, cost_frames,
+            allow_wait, cost_frames, reservations,
         )
     return result
 
 
 def _search_k(width, height, obstacles, frames, start, goal, costs, k,
               max_expanded=None, max_cost=None, allow_wait=False,
-              cost_frames=None):
+              cost_frames=None, reservations=None):
     """Best-first traversal of the feasible route tree keeping the k best.
 
     This is the ``plan_k`` search. As in ``_search_dynamic`` and
@@ -1821,7 +2030,8 @@ def _search_k(width, height, obstacles, frames, start, goal, costs, k,
     def heuristic(point):
         return abs(point[0] - goal[0]) + abs(point[1] - goal[1])
 
-    dynamic = frames is not None or cost_frames is not None
+    dynamic = (frames is not None or cost_frames is not None
+               or reservations is not None)
     last_frame = len(frames) - 1 if frames is not None else None
     last_cost_frame = (len(cost_frames) - 1
                        if cost_frames is not None else None)
@@ -1843,6 +2053,19 @@ def _search_k(width, height, obstacles, frames, start, goal, costs, k,
         if frames is None:
             return frozenset()
         return frames[t] if t <= last_frame else frames[last_frame]
+
+    # Reserved space-time routes: a candidate may not enter a reserved
+    # vertex at the arrival frame nor traverse the reverse of a reserved
+    # edge. The routes also provide time frames of their own, so the
+    # wait horizon extends to whichever of the dynamic frames and the
+    # reservation frames reaches further.
+    vertex_conflict, edge_conflict, res_horizon = _reservation_checks(
+        reservations
+    )
+    wait_horizon = last_frame if frames is not None else None
+    if res_horizon is not None:
+        wait_horizon = (res_horizon if wait_horizon is None
+                        else max(wait_horizon, res_horizon))
 
     # ``path`` is unique per candidate (revisits are forbidden and waits
     # only extend a route's own tail), so ``(f, path)`` is already a total
@@ -1886,6 +2109,8 @@ def _search_k(width, height, obstacles, frames, start, goal, costs, k,
             nxt = (nx, ny)
             if nxt in obstacles or nxt in frame or nxt in seen:
                 continue  # static obstacle, timed obstacle, or revisit
+            if vertex_conflict(nxt, next_t) or edge_conflict((x, y), nxt, t):
+                continue  # reserved vertex or reversed reserved edge
             new_g = g + step_cost(nxt, next_t)
             if max_cost is not None and new_g > max_cost:
                 # The candidate's accumulated cost exceeds the limit:
@@ -1901,8 +2126,9 @@ def _search_k(width, height, obstacles, frames, start, goal, costs, k,
                 (new_g + h, new_path, nx, ny, next_t, new_g,
                  seen | {nxt}),
             )
-        if (allow_wait and frames is not None and next_t <= last_frame
-                and cell not in frame):
+        if (allow_wait and wait_horizon is not None
+                and next_t <= wait_horizon and cell not in frame
+                and not vertex_conflict(cell, next_t)):
             # Waiting in place: one more frame at no entering-cell cost,
             # only within the provided frames and while the cell itself
             # is free at the next frame. The coordinate is already in
@@ -2081,14 +2307,15 @@ def _search_distance_field_any(width, height, obstacles, goals, costs,
 def _snapshot_checkpoint(planner, width, height, obstacles, start, endpoints,
                          costs, frames, max_cost, closed_count,
                          expanded_nodes, state, allow_wait=False,
-                         cost_frames=None):
+                         cost_frames=None, reservations=None):
     # The checkpoint is built from JSON-native values only (ints, strings,
     # lists, dicts, ``None``) in one fixed key order, and every list
     # derived from a set is sorted, so neither set iteration order, goal
     # order nor in-frame coordinate order can influence the result. The
     # ``max_cost`` field is only present when a cost limit was provided,
     # ``dynamic_costs`` is only present when time-varying costs were
-    # provided, and ``allow_wait`` is only recorded when waiting was
+    # provided, ``reservations`` is only present when reserved routes
+    # were provided, and ``allow_wait`` is only recorded when waiting was
     # enabled, so checkpoints of calls that do not use them keep their
     # exact previous shape.
     checkpoint = {
@@ -2114,6 +2341,13 @@ def _snapshot_checkpoint(planner, width, height, obstacles, start, endpoints,
     if cost_frames is not None:
         checkpoint["dynamic_costs"] = [
             [list(row) for row in frame] for frame in cost_frames
+        ]
+    if reservations is not None:
+        # The normalized routes: duplicate-free and sorted, so the
+        # recorded form never depends on the input order.
+        checkpoint["reservations"] = [
+            [[point[0], point[1]] for point in route]
+            for route in reservations
         ]
     if max_cost is not None:
         checkpoint["max_cost"] = max_cost
@@ -2179,15 +2413,18 @@ def _tree_snapshot_state(open_heap, best_key, planner, cost_limited,
 
 def _snapshot_checkpoint_multi(width, height, obstacles, starts, goal, costs,
                                frames, max_cost, closed_count, expanded_nodes,
-                               state, allow_wait=False, cost_frames=None):
+                               state, allow_wait=False, cost_frames=None,
+                               reservations=None):
     # The ``plan_multi_start`` checkpoint: like ``_snapshot_checkpoint``
     # but with the sorted start tuple in place of the single start. Only
     # JSON-native values are used and every set-derived list is sorted, so
     # neither obstacle-set iteration order, start order nor in-frame
     # coordinate order can influence the result. The ``max_cost`` field is
     # only present when a cost limit was provided, ``dynamic_costs`` is
-    # only present when time-varying costs were provided, and
-    # ``allow_wait`` is only recorded when waiting was enabled.
+    # only present when time-varying costs were provided,
+    # ``reservations`` is only present when reserved routes were
+    # provided, and ``allow_wait`` is only recorded when waiting was
+    # enabled.
     checkpoint = {
         "version": _SNAPSHOT_VERSION,
         "planner": "plan_multi_start",
@@ -2208,6 +2445,11 @@ def _snapshot_checkpoint_multi(width, height, obstacles, starts, goal, costs,
     if cost_frames is not None:
         checkpoint["dynamic_costs"] = [
             [list(row) for row in frame] for frame in cost_frames
+        ]
+    if reservations is not None:
+        checkpoint["reservations"] = [
+            [[point[0], point[1]] for point in route]
+            for route in reservations
         ]
     if max_cost is not None:
         checkpoint["max_cost"] = max_cost
@@ -2290,12 +2532,14 @@ def _check_heap_order(keys):
                 )
 
 
-def _restore_trace(raw, dynamic, unique, width, height, obstacles, frames):
+def _restore_trace(raw, dynamic, unique, width, height, obstacles, frames,
+                   reservations=None):
     # The recorded trace: coordinate pairs in static mode, ``(x, y, t)``
     # triples in dynamic mode. Structure problems are ``TypeError``; a
     # trace that could not have been produced by the search is a
     # ``ValueError`` (out-of-bounds cells, blocked cells, negative times,
-    # or duplicates where the search never records any).
+    # cells a reservation holds at that frame, or duplicates where the
+    # search never records any).
     if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
         raise TypeError(
             f"checkpoint trace must be a sequence of recorded nodes, "
@@ -2314,6 +2558,7 @@ def _restore_trace(raw, dynamic, unique, width, height, obstacles, frames):
             raise TypeError(f"{name} must contain only integers")
         entries.append(tuple(item))
     last_frame = len(frames) - 1 if frames is not None else None
+    vertex_conflict, _, _ = _reservation_checks(reservations)
     seen = set()
     for index, entry in enumerate(entries):
         cell = (entry[0], entry[1])
@@ -2335,6 +2580,13 @@ def _restore_trace(raw, dynamic, unique, width, height, obstacles, frames):
                         f"checkpoint trace[{index}] {cell} is blocked at "
                         f"frame {t}"
                     )
+            if t >= 1 and vertex_conflict(cell, t):
+                # Every closed state past the start frame was generated
+                # by a move, which never enters a reserved vertex.
+                raise ValueError(
+                    f"checkpoint trace[{index}] {cell} is reserved at "
+                    f"frame {t}"
+                )
         elif unique:
             # The static single-goal search closes each cell at most once.
             if entry in seen:
@@ -2548,12 +2800,13 @@ def _restore_static_state(raw, width, height, obstacles, start, goal,
 
 def _restore_tree_state(raw, planner, dynamic, width, height, obstacles,
                         frames, start, goal, goals, costs, closed_count,
-                        trace, max_cost, allow_wait=False, cost_frames=None):
+                        trace, max_cost, allow_wait=False, cost_frames=None,
+                        reservations=None):
     # Rebuild and fully cross-check a route-tree snapshot state (dynamic
     # ``plan``, and ``plan_any`` in both static and dynamic mode). Here
     # ``dynamic`` means the search is time-expanded, which timed obstacle
-    # frames or time-varying cost frames both cause; only the obstacle
-    # frames constrain cells and waits.
+    # frames, time-varying cost frames or reserved routes all cause; only
+    # the obstacle frames and the reservations constrain cells and waits.
     if not isinstance(raw, dict):
         raise TypeError(
             f"checkpoint state must be an object, got {type(raw).__name__}"
@@ -2590,6 +2843,17 @@ def _restore_tree_state(raw, planner, dynamic, width, height, obstacles,
         return costs[point[1]][point[0]]
 
     last_frame = len(frames) - 1 if frames is not None else None
+
+    # The reservation conflict predicates and the wait horizon the
+    # recorded time frames provide (the dynamic frames and the
+    # reservation frames, whichever reach further).
+    vertex_conflict, edge_conflict, res_horizon = _reservation_checks(
+        reservations
+    )
+    wait_horizon = last_frame if frames is not None else None
+    if res_horizon is not None:
+        wait_horizon = (res_horizon if wait_horizon is None
+                        else max(wait_horizon, res_horizon))
 
     # ---- structural pass: shapes and types only ----
     raw_open = raw["open"]
@@ -2662,11 +2926,11 @@ def _restore_tree_state(raw, planner, dynamic, width, height, obstacles,
                 # A consecutive repeat is only a legal wait when the
                 # checkpoint recorded ``allow_wait`` and the stay still
                 # lies within the provided frames.
-                if not (allow_wait and frames is not None):
+                if not (allow_wait and wait_horizon is not None):
                     raise ValueError(
                         "checkpoint candidate path repeats a coordinate"
                     )
-                if index > last_frame:
+                if index > wait_horizon:
                     raise ValueError(
                         "checkpoint candidate waits beyond the final frame"
                     )
@@ -2688,6 +2952,19 @@ def _restore_tree_state(raw, planner, dynamic, width, height, obstacles,
                     raise ValueError(
                         f"checkpoint candidate {cell} is blocked at "
                         f"frame {index}"
+                    )
+            if index >= 1:
+                # The start frame is exempt; every later frame was
+                # entered by a move, which never enters a reserved
+                # vertex nor reverses a reserved edge.
+                if vertex_conflict(cell, index):
+                    raise ValueError(
+                        f"checkpoint candidate {cell} is reserved at "
+                        f"frame {index}"
+                    )
+                if edge_conflict(previous, cell, index - 1):
+                    raise ValueError(
+                        "checkpoint candidate reverses a reserved edge"
                     )
             seen.add(cell)
             previous = cell
@@ -2944,11 +3221,13 @@ def _restore_multi_static_state(raw, width, height, obstacles, starts, goal,
 
 def _restore_multi_tree_state(raw, width, height, obstacles, frames, starts,
                               goal, costs, closed_count, trace, max_cost,
-                              allow_wait=False, cost_frames=None):
+                              allow_wait=False, cost_frames=None,
+                              reservations=None):
     # Rebuild and fully cross-check the multi-start route-tree snapshot
-    # state (dynamic ``plan_multi_start``). Timed obstacle frames or
-    # time-varying cost frames both make the search time-expanded; only
-    # the obstacle frames constrain cells and waits.
+    # state (dynamic ``plan_multi_start``). Timed obstacle frames,
+    # time-varying cost frames or reserved routes all make the search
+    # time-expanded; only the obstacle frames and the reservations
+    # constrain cells and waits.
     if not isinstance(raw, dict):
         raise TypeError(
             f"checkpoint state must be an object, got {type(raw).__name__}"
@@ -2980,6 +3259,17 @@ def _restore_multi_tree_state(raw, width, height, obstacles, frames, starts,
         return costs[point[1]][point[0]]
 
     last_frame = len(frames) - 1 if frames is not None else None
+
+    # The reservation conflict predicates and the wait horizon the
+    # recorded time frames provide (the dynamic frames and the
+    # reservation frames, whichever reach further).
+    vertex_conflict, edge_conflict, res_horizon = _reservation_checks(
+        reservations
+    )
+    wait_horizon = last_frame if frames is not None else None
+    if res_horizon is not None:
+        wait_horizon = (res_horizon if wait_horizon is None
+                        else max(wait_horizon, res_horizon))
 
     # ---- structural pass: shapes and types only ----
     raw_open = raw["open"]
@@ -3045,11 +3335,11 @@ def _restore_multi_tree_state(raw, width, height, obstacles, frames, starts,
                 # A consecutive repeat is only a legal wait when the
                 # checkpoint recorded ``allow_wait`` and the stay still
                 # lies within the provided frames.
-                if not (allow_wait and frames is not None):
+                if not (allow_wait and wait_horizon is not None):
                     raise ValueError(
                         "checkpoint candidate path repeats a coordinate"
                     )
-                if index > last_frame:
+                if index > wait_horizon:
                     raise ValueError(
                         "checkpoint candidate waits beyond the final frame"
                     )
@@ -3071,6 +3361,19 @@ def _restore_multi_tree_state(raw, width, height, obstacles, frames, starts,
                     raise ValueError(
                         f"checkpoint candidate {cell} is blocked at "
                         f"frame {index}"
+                    )
+            if index >= 1:
+                # The start frame is exempt; every later frame was
+                # entered by a move, which never enters a reserved
+                # vertex nor reverses a reserved edge.
+                if vertex_conflict(cell, index):
+                    raise ValueError(
+                        f"checkpoint candidate {cell} is reserved at "
+                        f"frame {index}"
+                    )
+                if edge_conflict(previous, cell, index - 1):
+                    raise ValueError(
+                        "checkpoint candidate reverses a reserved edge"
                     )
             seen.add(cell)
             previous = cell
@@ -3252,6 +3555,15 @@ def _restore_checkpoint(checkpoint):
                 f"checkpoint planner {planner!r} does not accept "
                 f"dynamic_costs"
             )
+    # The reserved routes are optional: checkpoints written before they
+    # existed (and checkpoints of searches without them) simply omit the
+    # field, which restores as ``None``. A present field follows the same
+    # rules as ``plan``'s ``reservations`` (structural problems raise
+    # ``TypeError``; empty paths, out-of-bounds, blocked or illegally
+    # repeated coordinates raise ``ValueError``).
+    reservations = _normalize_reservations(
+        checkpoint.get("reservations"), width, height, obstacles
+    )
     closed_count = checkpoint["closed"]
     if not _is_int(closed_count):
         raise TypeError(
@@ -3263,14 +3575,15 @@ def _restore_checkpoint(checkpoint):
             f"checkpoint closed must be a non-negative integer, "
             f"got {closed_count}"
         )
-    dynamic = frames is not None or cost_frames is not None
+    dynamic = (frames is not None or cost_frames is not None
+               or reservations is not None)
     # Only the static merged searches close each cell at most once;
     # route-tree searches may record the same cell through different
     # histories.
     unique_trace = planner in ("plan", "plan_multi_start") and not dynamic
     trace = _restore_trace(
         checkpoint["trace"], dynamic, unique_trace, width, height,
-        obstacles, frames
+        obstacles, frames, reservations
     )
     if len(trace) != closed_count:
         raise ValueError(
@@ -3296,7 +3609,7 @@ def _restore_checkpoint(checkpoint):
             state = _restore_multi_tree_state(
                 checkpoint["state"], width, height, obstacles, frames,
                 starts, goal, costs, closed_count, trace, max_cost,
-                allow_wait, cost_frames
+                allow_wait, cost_frames, reservations
             )
         else:
             state = _restore_multi_static_state(
@@ -3307,7 +3620,7 @@ def _restore_checkpoint(checkpoint):
         state = _restore_tree_state(
             checkpoint["state"], planner, dynamic, width, height,
             obstacles, frames, start, goal, goals, costs, closed_count,
-            trace, max_cost, allow_wait, cost_frames
+            trace, max_cost, allow_wait, cost_frames, reservations
         )
     return {
         "planner": planner,
@@ -3321,6 +3634,7 @@ def _restore_checkpoint(checkpoint):
         "costs": costs,
         "frames": frames,
         "cost_frames": cost_frames,
+        "reservations": reservations,
         "max_cost": max_cost,
         "allow_wait": allow_wait,
         "state": state,
@@ -3329,7 +3643,8 @@ def _restore_checkpoint(checkpoint):
 
 def plan(width, height, blocked, start, goal, costs=None, trace=False,
          dynamic_blocked=None, max_expanded=None, snapshot=False,
-         max_cost=None, allow_wait=False, dynamic_costs=None):
+         max_cost=None, allow_wait=False, dynamic_costs=None,
+         reservations=None):
     # --- Validation: everything is checked before the search begins. ---
     width = _validate_dimension(width, "width")
     height = _validate_dimension(height, "height")
@@ -3367,11 +3682,17 @@ def plan(width, height, blocked, start, goal, costs=None, trace=False,
         raise ValueError(
             "costs and dynamic_costs cannot both be provided"
         )
-    if frames is not None or cost_frames is not None:
+    # The reserved routes follow every pre-existing check, still before
+    # the search starts.
+    reservation_routes = _normalize_reservations(
+        reservations, width, height, obstacles
+    )
+    if (frames is not None or cost_frames is not None
+            or reservation_routes is not None):
         return _search_dynamic(
             width, height, obstacles, frames, start, goal, costs, trace,
             max_expanded, max_cost, snapshot, allow_wait,
-            cost_frames=cost_frames
+            cost_frames=cost_frames, reservations=reservation_routes
         )
     return _search_static(
         width, height, obstacles, start, goal, costs, trace, max_expanded,
@@ -3381,7 +3702,8 @@ def plan(width, height, blocked, start, goal, costs=None, trace=False,
 
 def plan_any(width, height, blocked, start, goals, costs=None, trace=False,
              dynamic_blocked=None, max_expanded=None, snapshot=False,
-             max_cost=None, allow_wait=False, dynamic_costs=None):
+             max_cost=None, allow_wait=False, dynamic_costs=None,
+             reservations=None):
     # --- Validation: ``goals`` takes ``goal``'s exact position in       ---
     # --- ``plan``'s validation sequence; every shared check keeps its   ---
     # --- order, exception type and message boundary.                    ---
@@ -3422,16 +3744,22 @@ def plan_any(width, height, blocked, start, goals, costs=None, trace=False,
         raise ValueError(
             "costs and dynamic_costs cannot both be provided"
         )
+    # The reserved routes follow every pre-existing check, still before
+    # the search starts.
+    reservation_routes = _normalize_reservations(
+        reservations, width, height, obstacles
+    )
     return _search_any(
         width, height, obstacles, frames, start, goal_points, costs, trace,
         max_expanded, max_cost, snapshot, allow_wait,
-        cost_frames=cost_frames
+        cost_frames=cost_frames, reservations=reservation_routes
     )
 
 
 def plan_batch(width, height, blocked, requests, costs=None, trace=False,
                dynamic_blocked=None, max_expanded=None, snapshot=False,
-               max_cost=None, allow_wait=False, dynamic_costs=None):
+               max_cost=None, allow_wait=False, dynamic_costs=None,
+               reservations=None):
     # --- Validation: ``plan``'s shared checks in their usual order,    ---
     # --- with ``requests`` occupying the position of ``start``/``goal``---
     # --- in that sequence. Every check is decided before any search    ---
@@ -3479,6 +3807,11 @@ def plan_batch(width, height, blocked, requests, costs=None, trace=False,
         raise ValueError(
             "costs and dynamic_costs cannot both be provided"
         )
+    # The reserved routes follow every pre-existing check, still before
+    # any request is searched.
+    reservation_routes = _normalize_reservations(
+        reservations, width, height, obstacles
+    )
     # Each request is an independent ``plan`` search over the shared,
     # already normalized grid: ``path``/``cost``/``expanded`` are
     # produced per query and the budget and cost limit apply per query,
@@ -3486,11 +3819,12 @@ def plan_batch(width, height, blocked, requests, costs=None, trace=False,
     # order and duplicate requests are preserved in the results.
     results = []
     for start, goal in pairs:
-        if frames is not None or cost_frames is not None:
+        if (frames is not None or cost_frames is not None
+                or reservation_routes is not None):
             results.append(_search_dynamic(
                 width, height, obstacles, frames, start, goal, costs,
                 trace, max_expanded, max_cost, snapshot, allow_wait,
-                cost_frames=cost_frames
+                cost_frames=cost_frames, reservations=reservation_routes
             ))
         else:
             results.append(_search_static(
@@ -3503,7 +3837,7 @@ def plan_batch(width, height, blocked, requests, costs=None, trace=False,
 def plan_multi_start(width, height, blocked, starts, goal, costs=None,
                      trace=False, dynamic_blocked=None, max_expanded=None,
                      snapshot=False, max_cost=None, allow_wait=False,
-                     dynamic_costs=None):
+                     dynamic_costs=None, reservations=None):
     # --- Validation: ``starts`` takes ``start``'s exact position in     ---
     # --- ``plan``'s validation sequence; every shared check keeps its   ---
     # --- order, exception type and message boundary.                    ---
@@ -3544,11 +3878,17 @@ def plan_multi_start(width, height, blocked, starts, goal, costs=None,
         raise ValueError(
             "costs and dynamic_costs cannot both be provided"
         )
-    if frames is not None or cost_frames is not None:
+    # The reserved routes follow every pre-existing check, still before
+    # the search starts.
+    reservation_routes = _normalize_reservations(
+        reservations, width, height, obstacles
+    )
+    if (frames is not None or cost_frames is not None
+            or reservation_routes is not None):
         return _search_multi_dynamic(
             width, height, obstacles, frames, start_points, goal, costs,
             trace, max_expanded, max_cost, snapshot, allow_wait,
-            cost_frames=cost_frames
+            cost_frames=cost_frames, reservations=reservation_routes
         )
     return _search_multi_static(
         width, height, obstacles, start_points, goal, costs, trace,
@@ -3558,7 +3898,7 @@ def plan_multi_start(width, height, blocked, starts, goal, costs=None,
 
 def plan_k(width, height, blocked, start, goal, k, costs=None,
            dynamic_blocked=None, max_expanded=None, max_cost=None,
-           allow_wait=False, dynamic_costs=None):
+           allow_wait=False, dynamic_costs=None, reservations=None):
     """Return up to ``k`` distinct routes ordered by priority.
 
     ``plan_k(width, height, blocked, start, goal, k, costs=None,
@@ -3646,9 +3986,14 @@ def plan_k(width, height, blocked, start, goal, k, costs=None,
         raise ValueError(
             "costs and dynamic_costs cannot both be provided"
         )
+    # The reserved routes follow every pre-existing check, still before
+    # the search starts.
+    reservation_routes = _normalize_reservations(
+        reservations, width, height, obstacles
+    )
     return _search_k(width, height, obstacles, frames, start, goal,
                      costs, k, max_expanded, max_cost, allow_wait,
-                     cost_frames=cost_frames)
+                     cost_frames=cost_frames, reservations=reservation_routes)
 
 
 def distance_field(width, height, blocked, goal, costs=None, trace=False):
@@ -3752,7 +4097,7 @@ def distance_field_any(width, height, blocked, goals, costs=None,
 
 def replay(width, height, blocked, start, goal, path, costs=None,
            dynamic_blocked=None, diagnose=False, allow_wait=False,
-           dynamic_costs=None):
+           dynamic_costs=None, reservations=None):
     # --- Validation: identical to ``plan`` and fully completed before ---
     # --- the candidate path is inspected or judged in any way.        ---
     width = _validate_dimension(width, "width")
@@ -3777,12 +4122,16 @@ def replay(width, height, blocked, start, goal, path, costs=None,
         )
     # The time-varying cost frames follow every pre-existing check, still
     # before the path structure is inspected; providing both ``costs``
-    # and ``dynamic_costs`` is a ``ValueError``.
+    # and ``dynamic_costs`` is a ``ValueError``. The reserved routes come
+    # last of all, still before the path is judged.
     cost_frames = _normalize_dynamic_costs(dynamic_costs, width, height)
     if cost_frames is not None and costs is not None:
         raise ValueError(
             "costs and dynamic_costs cannot both be provided"
         )
+    reservation_routes = _normalize_reservations(
+        reservations, width, height, obstacles
+    )
     points = _normalize_path(path, width, height)
 
     last_cost_frame = (len(cost_frames) - 1
@@ -3827,20 +4176,35 @@ def replay(width, height, blocked, start, goal, path, costs=None,
         return result
 
     last_frame = len(frames) - 1 if frames is not None else None
+    # The reservation conflict predicates and the wait horizon the
+    # provided time frames allow (the dynamic frames and the reservation
+    # frames, whichever reach further).
+    vertex_conflict, edge_conflict, res_horizon = _reservation_checks(
+        reservation_routes
+    )
+    wait_horizon = last_frame if frames is not None else None
+    if res_horizon is not None:
+        wait_horizon = (res_horizon if wait_horizon is None
+                        else max(wait_horizon, res_horizon))
     seen = set()
     total = 0
     previous = None
     for t, point in enumerate(points):
         if point in seen:
             # A consecutive stay is a legal wait only with ``allow_wait``
-            # and dynamic frames, and only while the stay still lies
-            # within the provided frames; it adds no entering-cell cost.
-            if (allow_wait and frames is not None
+            # and provided time frames, and only while the stay still
+            # lies within those frames; it adds no entering-cell cost.
+            if (allow_wait and wait_horizon is not None
                     and previous is not None and point == previous):
-                if t > last_frame:
+                if t > wait_horizon:
                     return invalid("wait_after_final_frame", t)
-                if point in frames[t]:
-                    return invalid("dynamic_blocked", t)
+                if frames is not None:
+                    frame = (frames[t] if t <= last_frame
+                             else frames[last_frame])
+                    if point in frame:
+                        return invalid("dynamic_blocked", t)
+                if vertex_conflict(point, t):
+                    return invalid("reservation_vertex", t)
                 previous = point
                 continue
             return invalid("repeated_coordinate", t)  # second occurrence
@@ -3855,6 +4219,13 @@ def replay(width, height, blocked, start, goal, path, costs=None,
             frame = frames[t] if t <= last_frame else frames[last_frame]
             if point in frame:
                 return invalid("dynamic_blocked", t)  # blocked at frame t
+        if t >= 1 and vertex_conflict(point, t):
+            # The start frame is exempt; every later frame is entered by
+            # a move, which may not enter a reserved vertex.
+            return invalid("reservation_vertex", t)
+        if previous is not None and edge_conflict(previous, point, t - 1):
+            # The move traverses the reverse of a reserved edge.
+            return invalid("reservation_edge", t)
         seen.add(point)
         previous = point
     result = {"valid": True, "cost": total, "steps": len(points) - 1}
@@ -3873,14 +4244,16 @@ def resume(checkpoint, max_expanded=None):
     # A resume always continues with the trace recorded (the checkpoint
     # carries it) and always snapshots again if the budget stops the
     # search once more. The checkpoint's cost limit (``None`` when the
-    # field is absent), its waiting flag (``False`` when absent) and its
-    # time-varying cost frames (``None`` when absent) keep governing the
-    # search.
+    # field is absent), its waiting flag (``False`` when absent), its
+    # time-varying cost frames and its reserved routes (``None`` when
+    # absent) keep governing the search.
     max_cost = restored["max_cost"]
     allow_wait = restored["allow_wait"]
     cost_frames = restored["cost_frames"]
+    reservations = restored["reservations"]
     if restored["planner"] == "plan_multi_start":
-        if restored["frames"] is None and cost_frames is None:
+        if (restored["frames"] is None and cost_frames is None
+                and reservations is None):
             return _search_multi_static(
                 restored["width"], restored["height"],
                 restored["obstacles"], restored["starts"],
@@ -3893,10 +4266,10 @@ def resume(checkpoint, max_expanded=None):
             restored["frames"], restored["starts"], restored["goal"],
             restored["costs"], True, max_expanded, max_cost, snapshot=True,
             allow_wait=allow_wait, state=restored["state"],
-            cost_frames=cost_frames
+            cost_frames=cost_frames, reservations=reservations
         )
     if (restored["planner"] == "plan" and restored["frames"] is None
-            and cost_frames is None):
+            and cost_frames is None and reservations is None):
         return _search_static(
             restored["width"], restored["height"], restored["obstacles"],
             restored["start"], restored["goal"], restored["costs"],
@@ -3909,12 +4282,12 @@ def resume(checkpoint, max_expanded=None):
             restored["frames"], restored["start"], restored["goal"],
             restored["costs"], True, max_expanded, max_cost, snapshot=True,
             allow_wait=allow_wait, state=restored["state"],
-            cost_frames=cost_frames
+            cost_frames=cost_frames, reservations=reservations
         )
     return _search_any(
         restored["width"], restored["height"], restored["obstacles"],
         restored["frames"], restored["start"], restored["goals"],
         restored["costs"], True, max_expanded, max_cost, snapshot=True,
         allow_wait=allow_wait, state=restored["state"],
-        cost_frames=cost_frames
+        cost_frames=cost_frames, reservations=reservations
     )

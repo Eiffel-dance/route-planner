@@ -20,6 +20,9 @@ max_cost=None, allow_wait=False, dynamic_costs=None, reservations=None)``,
 dynamic_blocked=None, diagnose=False, allow_wait=False,
 dynamic_costs=None, reservations=None)``,
 ``resume(checkpoint, max_expanded=None)``,
+``verify_trace(width, height, blocked, start, goal, costs=None,
+dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None,
+allow_wait=False, dynamic_costs=None, reservations=None, record=None)``,
 ``distance_field(width, height, blocked, goal, costs=None, trace=False)``
 and
 ``distance_field_any(width, height, blocked, goals, costs=None,
@@ -561,6 +564,46 @@ Offline replay (``replay``):
   ties resolve to the earliest rule in this list and no partial cost is
   ever returned.
 
+Offline audit (``verify_trace``):
+- ``verify_trace(width, height, blocked, start, goal, costs=None,
+  dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None,
+  allow_wait=False, dynamic_costs=None, reservations=None, record=None)``
+  audits a saved planning record offline: it recomputes the deterministic
+  result the same arguments produce and reports whether the record
+  matches it. It accepts ``plan``'s arguments (only ``trace`` is absent:
+  a record always corresponds to a ``trace=True`` result) plus the
+  ``record`` object, which may be the direct return value of a
+  ``trace=True`` call or its JSON round-tripped equivalent.
+- All of ``plan``'s parameter validation runs first, in ``plan``'s
+  public order; the record is only inspected afterwards, so a missing
+  or malformed record never skips grid or constraint validation.
+- The record must be an object carrying at least ``path``, ``cost``,
+  ``expanded`` and ``expanded_nodes``; when the corresponding result
+  carries ``status`` or ``checkpoint`` those are verified item by item
+  as well. Coordinate pairs and triples may be lists or tuples, key
+  order is irrelevant and extra fields are ignored.
+- A record that is not an object, misses a required field, has wrongly
+  typed fields or a malformed trace shape raises ``TypeError``;
+  out-of-bounds coordinates, trace entries inconsistent with the
+  current static or dynamic mode, or an invalid checkpoint structure
+  raise ``ValueError``. Every such check is decided before the audit
+  search starts.
+- A structurally legal record whose content disagrees with the
+  recomputed result does not raise: the return is always
+  ``{"valid": bool, "mismatch": ..., "index": ...}``. ``mismatch``
+  reports the first differing field in the order ``path``, ``cost``,
+  ``expanded``, ``expanded_nodes``, ``status``, ``checkpoint``; path
+  and trace differences also report the zero-based ``index`` of the
+  first differing element, every other difference reports ``None``.
+  A fully matching record returns ``valid`` true with ``mismatch`` and
+  ``index`` both ``None``. The audit covers unreachable and
+  ``start == goal`` results, cost matrices, time-varying costs, dynamic
+  obstacles, waiting, reservations, ``max_expanded``, ``max_cost`` and
+  resumed (checkpoint) records; ``expanded_nodes`` can only correspond
+  to actually closed, non-duplicate states. The result is
+  JSON-serializable, the inputs are never modified or completed, and no
+  partially recomputed values leak into the report.
+
 Distance field (``distance_field``):
 - ``distance_field(width, height, blocked, goal, costs=None,
   trace=False)`` is an offline analysis entry point for the static grid:
@@ -672,7 +715,8 @@ from collections.abc import Iterable, Sequence
 
 __all__ = ["plan", "plan_any", "plan_k", "plan_batch", "plan_agents",
            "plan_multi_start",
-           "replay", "resume", "distance_field", "distance_field_any"]
+           "replay", "resume", "verify_trace",
+           "distance_field", "distance_field_any"]
 
 # Fixed neighbor generation order: +x, -x, +y, -y.
 _NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1))
@@ -4550,3 +4594,217 @@ def resume(checkpoint, max_expanded=None):
         allow_wait=allow_wait, state=restored["state"],
         cost_frames=cost_frames, reservations=reservations
     )
+
+
+def _first_difference(expected, recorded):
+    # Zero-based index of the first position where two sequences differ;
+    # a length difference surfaces at the end of the shorter one.
+    for index, (want, got) in enumerate(zip(expected, recorded)):
+        if want != got:
+            return index
+    return min(len(expected), len(recorded))
+
+
+def _json_normalized(value):
+    # Lists and tuples both represent JSON arrays and dict key order is
+    # irrelevant, so containers are normalized recursively before two
+    # JSON-style structures are compared.
+    if isinstance(value, (list, tuple)):
+        return [_json_normalized(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _json_normalized(item) for key, item in value.items()}
+    return value
+
+
+def verify_trace(width, height, blocked, start, goal, costs=None,
+                 dynamic_blocked=None, max_expanded=None, snapshot=False,
+                 max_cost=None, allow_wait=False, dynamic_costs=None,
+                 reservations=None, record=None):
+    # --- Validation: ``plan``'s public checks in their public order     ---
+    # --- (only the ``trace`` flag is absent: a record always            ---
+    # --- corresponds to a ``trace=True`` result), all decided before    ---
+    # --- the record is inspected, so a missing or malformed record      ---
+    # --- never skips grid or constraint validation.                     ---
+    width = _validate_dimension(width, "width")
+    height = _validate_dimension(height, "height")
+    start = _normalize_point(start, "start")
+    goal = _normalize_point(goal, "goal")
+    _check_bounds(start, width, height, "start")
+    _check_bounds(goal, width, height, "goal")
+    obstacles = _normalize_blocked(blocked, width, height)
+    if start in obstacles:
+        raise ValueError(f"start {start} lies on a blocked cell")
+    if goal in obstacles:
+        raise ValueError(f"goal {goal} lies on a blocked cell")
+    costs = _normalize_costs(costs, width, height)
+    frames = _normalize_dynamic_blocked(dynamic_blocked, width, height)
+    if frames is not None and start in frames[0]:
+        raise ValueError(
+            f"start {start} is blocked at frame 0"
+        )
+    # The waiting flag, budget, snapshot flag, cost limit, time-varying
+    # cost frames and reserved routes keep exactly ``plan``'s positions.
+    _validate_allow_wait(allow_wait)
+    _validate_budget(max_expanded)
+    _validate_snapshot_flag(snapshot)
+    _validate_max_cost(max_cost)
+    cost_frames = _normalize_dynamic_costs(dynamic_costs, width, height)
+    if cost_frames is not None and costs is not None:
+        raise ValueError(
+            "costs and dynamic_costs cannot both be provided"
+        )
+    reservation_paths = _normalize_reservations(
+        reservations, width, height, obstacles
+    )
+    dynamic = (frames is not None or cost_frames is not None
+               or reservation_paths is not None)
+
+    # --- Record validation: structure, field types, coordinate bounds, ---
+    # --- trace/mode consistency and the checkpoint's own validity are  ---
+    # --- all decided here, before the audit search runs. Extra fields  ---
+    # --- are ignored and key order never matters.                      ---
+    if not isinstance(record, dict):
+        raise TypeError(
+            f"record must be a result object, got {type(record).__name__}"
+        )
+    for key in ("path", "cost", "expanded", "expanded_nodes"):
+        if key not in record:
+            raise TypeError(f"record is missing required field {key!r}")
+    # The corresponding result carries ``status'' exactly when a budget
+    # or a cost limit was provided, which the arguments alone decide.
+    has_status = max_expanded is not None or max_cost is not None
+    if has_status and "status" not in record:
+        raise TypeError("record is missing required field 'status'")
+    raw_path = record["path"]
+    if raw_path is None:
+        record_path = None
+    else:
+        if isinstance(raw_path, (str, bytes)) or not isinstance(
+            raw_path, Sequence
+        ):
+            raise TypeError(
+                f"record path must be null or a sequence of grid "
+                f"coordinates, got {type(raw_path).__name__}"
+            )
+        record_path = []
+        for index, item in enumerate(raw_path):
+            name = f"record path[{index}]"
+            point = _normalize_point(item, name)
+            _check_bounds(point, width, height, name)
+            record_path.append(point)
+    record_cost = record["cost"]
+    if record_cost is not None and not _is_int(record_cost):
+        raise TypeError(
+            f"record cost must be null or an int, "
+            f"got {type(record_cost).__name__}"
+        )
+    record_expanded = record["expanded"]
+    if not _is_int(record_expanded):
+        raise TypeError(
+            f"record expanded must be an int, "
+            f"got {type(record_expanded).__name__}"
+        )
+    raw_nodes = record["expanded_nodes"]
+    if isinstance(raw_nodes, (str, bytes)) or not isinstance(
+        raw_nodes, Sequence
+    ):
+        raise TypeError(
+            f"record expanded_nodes must be a sequence of recorded "
+            f"nodes, got {type(raw_nodes).__name__}"
+        )
+    # A recorded node is a coordinate pair or triple (lists and tuples
+    # alike); which of the two the search could have produced is decided
+    # by the static/dynamic mode the arguments alone select.
+    arity = 3 if dynamic else 2
+    record_nodes = []
+    for index, item in enumerate(raw_nodes):
+        name = f"record expanded_nodes[{index}]"
+        if isinstance(item, (str, bytes)) or not isinstance(item, Sequence):
+            raise TypeError(
+                f"{name} must be a sequence of two or three integers, "
+                f"got {type(item).__name__}"
+            )
+        if len(item) not in (2, 3):
+            raise TypeError(
+                f"{name} must contain two or three integers, "
+                f"got {len(item)}"
+            )
+        if not all(_is_int(value) for value in item):
+            raise TypeError(f"{name} must contain only integers")
+        if len(item) != arity:
+            raise ValueError(
+                f"{name} does not match the "
+                f"{'dynamic' if dynamic else 'static'} search mode"
+            )
+        _check_bounds((item[0], item[1]), width, height, name)
+        if dynamic and item[2] < 0:
+            raise ValueError(f"{name} has a negative time {item[2]}")
+        record_nodes.append(tuple(item))
+    if has_status and not isinstance(record["status"], str):
+        raise TypeError(
+            f"record status must be a string, "
+            f"got {type(record['status']).__name__}"
+        )
+    # A checkpoint can only be part of the corresponding result when a
+    # snapshot was requested together with a budget; a checkpoint field
+    # in any other record is an extra field and ignored. A present
+    # candidate must be a checkpoint the planner could have written, so
+    # it is checked with ``resume``'s own rules and every structural
+    # problem raises ``ValueError`` here, before the audit search.
+    record_checkpoint = None
+    if snapshot and max_expanded is not None and "checkpoint" in record:
+        record_checkpoint = record["checkpoint"]
+        try:
+            _restore_checkpoint(record_checkpoint)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"record checkpoint is not a valid checkpoint: {exc}"
+            ) from None
+
+    # --- Audit search: the deterministic result the same arguments     ---
+    # --- produce, always traced so every recorded field has a reference.--
+    if dynamic:
+        expected = _search_dynamic(
+            width, height, obstacles, frames, start, goal, costs, True,
+            max_expanded, max_cost, snapshot, allow_wait,
+            cost_frames=cost_frames, reservations=reservation_paths
+        )
+    else:
+        expected = _search_static(
+            width, height, obstacles, start, goal, costs, True,
+            max_expanded, max_cost, snapshot, allow_wait
+        )
+
+    # --- Comparison: the first differing field in the fixed order      ---
+    # --- path, cost, expanded, expanded_nodes, status, checkpoint;     ---
+    # --- path and trace differences also report the first differing    ---
+    # --- zero-based index. The report never leaks recomputed values.   ---
+    expected_path = expected["path"]
+    if (record_path is None) != (expected_path is None):
+        return {"valid": False, "mismatch": "path", "index": 0}
+    if record_path is not None and tuple(record_path) != tuple(expected_path):
+        return {
+            "valid": False,
+            "mismatch": "path",
+            "index": _first_difference(expected_path, record_path),
+        }
+    if record_cost != expected["cost"]:
+        return {"valid": False, "mismatch": "cost", "index": None}
+    if record_expanded != expected["expanded"]:
+        return {"valid": False, "mismatch": "expanded", "index": None}
+    expected_nodes = expected["expanded_nodes"]
+    if tuple(record_nodes) != tuple(expected_nodes):
+        return {
+            "valid": False,
+            "mismatch": "expanded_nodes",
+            "index": _first_difference(expected_nodes, record_nodes),
+        }
+    if "status" in expected and record["status"] != expected["status"]:
+        return {"valid": False, "mismatch": "status", "index": None}
+    if "checkpoint" in expected:
+        if record_checkpoint is None or (
+            _json_normalized(record_checkpoint)
+            != _json_normalized(expected["checkpoint"])
+        ):
+            return {"valid": False, "mismatch": "checkpoint", "index": None}
+    return {"valid": True, "mismatch": None, "index": None}

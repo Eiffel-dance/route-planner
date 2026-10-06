@@ -159,3 +159,13 @@ Tests: python3 -m unittest discover -s tests -v
 - 路径选择沿用动态模式裁决：先总 `cost`，再到达步数，再完整坐标序列字典序；`expanded` 只统计实际关闭的时空状态，`trace` 记录 `(x, y, t)` 三元组，不可达仍返回既有空路径结果；`start` 在第 0 帧被预约时不存在可行路线。
 - `max_expanded`、`max_cost`、`plan_k`、`plan_batch` 与 `plan_multi_start` 沿用各自的 `status`、截断与独立查询语义；`snapshot=True` 的 checkpoint 记录规范化后的 `reservations`（未提供时不新增该字段），`resume` 与一次未中断的搜索逐字段一致，损坏的 `reservations` 快照分别报告 `TypeError` 或 `ValueError`。
 - `replay` 在相同预约下重算成功路径的 `cost` 与 `steps`；`diagnose=True` 时对顶点冲突返回 `reservation_vertex`、对反向边冲突返回 `reservation_edge`，并给出首次违规元素的索引，其他非法路径继续使用既有固定结构与错误码。
+
+`verify_trace(width, height, blocked, start, goal, costs=None, dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None, allow_wait=False, dynamic_costs=None, reservations=None, record=None)` 是离线审计入口：在不改变 `plan` 既有行为的前提下，判断保存的规划记录是否与同参数的确定性结果一致。
+
+**离线审计（`verify_trace`）**
+- 入口接收与 `plan` 相同的网格、端点、代价、动态障碍、等待、预算、快照和预约参数（唯独没有 `trace`：记录总是对应 `trace=True` 的结果），以及 `record`；`record` 既可直接使用 `trace=True` 调用的返回值，也可使用其 JSON 往返后的等价对象。
+- 审计先按 `plan` 的公开顺序完成全部参数校验，再检查 `record`：记录缺失或畸形绝不跳过网格或约束校验。
+- `record` 必须是至少包含 `path`、`cost`、`expanded`、`expanded_nodes` 的对象；当对应结果携带 `status`（提供了 `max_expanded` 或 `max_cost`）或 `checkpoint`（`snapshot` 加预算且预算耗尽）时，这两项也逐项核对。坐标二元或三元序列允许列表和元组，键顺序不影响判断，额外字段忽略。
+- `record` 不是对象、缺字段、字段类型错误或轨迹形状错误抛 `TypeError`；坐标越界、轨迹状态与当前静态或动态模式不符（静态模式出现三元组或动态模式出现二元组）、`checkpoint` 结构不合法抛 `ValueError`；这些都在审计搜索前确定。
+- 结构合法但内容不一致时不抛异常，固定返回 `{"valid", "mismatch", "index"}` 三个键：`mismatch` 按 `path`、`cost`、`expanded`、`expanded_nodes`、`status`、`checkpoint` 的顺序报告首个差异字段；路径或轨迹差异额外给出首个不同元素的零基 `index`，其余差异为 `None`；完全一致时 `valid` 为 `True` 且另两键为 `None`。
+- 比较覆盖不可达、`start == goal`、代价矩阵、动态代价、动态障碍、允许等待、预约、`max_expanded`、`max_cost` 及 `resume` 记录（`record` 可直接是 `resume` 的返回值，按累计预算审计）；`expanded_nodes` 只对应实际关闭且不重复的状态。结果可 JSON 序列化，输入不被修改或补全，报告中不泄露任何部分重算值；不调用 `verify_trace` 时，现有所有入口的签名、返回键、异常边界、校验顺序、tie-break、路径和统计保持不变。

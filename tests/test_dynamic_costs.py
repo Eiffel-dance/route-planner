@@ -26,16 +26,35 @@ class LegacyBehaviorTests(unittest.TestCase):
                       costs=[[1, 1], [1, 1]], dynamic_costs=[])
         self.assertEqual(result["cost"], 2)
 
-    def test_other_entry_points_have_no_dynamic_costs_parameter(self):
-        with self.assertRaises(TypeError):
-            plan_k(3, 2, [], (0, 0), (2, 0), 2,
-                   dynamic_costs=frames_all(3, 2, 1, 1))
-        with self.assertRaises(TypeError):
-            plan_multi_start(3, 2, [], [(0, 0)], (2, 0),
-                             dynamic_costs=frames_all(3, 2, 1, 1))
-        with self.assertRaises(TypeError):
-            plan_batch(3, 2, [], [[(0, 0), (2, 0)]],
-                       dynamic_costs=frames_all(3, 2, 1, 1))
+    def test_other_entry_points_omitted_none_and_empty_are_equivalent(self):
+        base_k = plan_k(3, 2, [], (0, 0), (2, 0), 2)
+        base_multi = plan_multi_start(3, 2, [], [(0, 0)], (2, 0), trace=True)
+        base_batch = plan_batch(3, 2, [], [[(0, 0), (2, 0)]], trace=True)
+        for dynamic_costs in (None, []):
+            self.assertEqual(
+                plan_k(3, 2, [], (0, 0), (2, 0), 2,
+                       dynamic_costs=dynamic_costs), base_k)
+            self.assertEqual(
+                plan_multi_start(3, 2, [], [(0, 0)], (2, 0), trace=True,
+                                 dynamic_costs=dynamic_costs), base_multi)
+            self.assertEqual(
+                plan_batch(3, 2, [], [[(0, 0), (2, 0)]], trace=True,
+                           dynamic_costs=dynamic_costs), base_batch)
+        self.assertEqual(set(base_k), {"paths", "costs", "expanded"})
+        self.assertEqual(set(base_multi),
+                         {"path", "cost", "expanded", "expanded_nodes"})
+
+    def test_empty_sequence_does_not_conflict_with_costs_everywhere(self):
+        matrix = [[1, 1], [1, 1]]
+        self.assertEqual(
+            plan_k(2, 2, [], (0, 0), (1, 1), 1, costs=matrix,
+                   dynamic_costs=[])["costs"], [2])
+        self.assertEqual(
+            plan_multi_start(2, 2, [], [(0, 0)], (1, 1), costs=matrix,
+                             dynamic_costs=[])["cost"], 2)
+        self.assertEqual(
+            plan_batch(2, 2, [], [[(0, 0), (1, 1)]], costs=matrix,
+                       dynamic_costs=[])["results"][0]["cost"], 2)
 
 
 class ValidationTests(unittest.TestCase):
@@ -354,15 +373,292 @@ class SnapshotResumeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             resume(checkpoint)
 
-    def test_dynamic_costs_rejected_for_multi_start_checkpoint(self):
+    def test_dynamic_costs_injected_into_static_multi_start_checkpoint(self):
+        # A checkpoint recorded without time-varying costs cannot be
+        # retrofitted with them: the recorded trace and state are
+        # inconsistent with a time-expanded search.
         result = plan_multi_start(4, 3, [(1, 1)], [(0, 0)], (3, 2),
                                   max_expanded=2, snapshot=True)
         if "checkpoint" not in result:
             self.skipTest("search finished before the budget stopped it")
         checkpoint = json.loads(json.dumps(result["checkpoint"]))
         checkpoint["dynamic_costs"] = self.dynamic_costs
-        with self.assertRaises(ValueError):
+        with self.assertRaises(TypeError):
             resume(checkpoint)
+
+
+class PlanBatchTests(unittest.TestCase):
+    def setUp(self):
+        self.dynamic_costs = [
+            [[1, 1, 1], [1, 1, 1]],
+            [[1, 9, 1], [1, 1, 1]],
+            [[1, 1, 9], [1, 1, 1]],
+            [[1, 1, 1], [1, 1, 1]],
+            [[1, 1, 1], [1, 1, 1]],
+        ]
+
+    def test_results_match_independent_plan_calls(self):
+        requests = [[(0, 0), (2, 0)], [(2, 1), (0, 0)], [(0, 0), (2, 0)]]
+        batched = plan_batch(3, 2, [], requests,
+                             dynamic_costs=self.dynamic_costs, trace=True,
+                             max_cost=10)
+        self.assertEqual(len(batched["results"]), 3)
+        for (start, goal), result in zip(requests, batched["results"]):
+            expected = plan(3, 2, [], start, goal,
+                            dynamic_costs=self.dynamic_costs, trace=True,
+                            max_cost=10)
+            self.assertEqual(result, expected)
+
+    def test_per_query_cost_limits(self):
+        requests = [[(0, 0), (2, 0)], [(0, 0), (2, 0)]]
+        batched = plan_batch(3, 2, [], requests,
+                             dynamic_costs=self.dynamic_costs, max_cost=3)
+        for result in batched["results"]:
+            self.assertEqual(result["status"], "cost_exhausted")
+            self.assertIsNone(result["path"])
+
+    def test_validation_before_any_search(self):
+        with self.assertRaises(ValueError):
+            plan_batch(3, 2, [], [[(0, 0), (2, 0)], [(0, 0), (2, 1)]],
+                       dynamic_costs=[[[1, 1, 1]]])
+        with self.assertRaises(TypeError):
+            plan_batch(3, 2, [], [[(0, 0), (2, 0)]], dynamic_costs="x")
+        with self.assertRaises(ValueError):
+            plan_batch(3, 2, [], [[(0, 0), (2, 0)]],
+                       costs=[[1, 1, 1], [1, 1, 1]],
+                       dynamic_costs=self.dynamic_costs)
+
+    def test_trace_records_space_time_triples(self):
+        result = plan_batch(3, 2, [], [[(0, 0), (2, 0)]],
+                            dynamic_costs=frames_all(3, 2, 1, 3),
+                            trace=True)
+        nodes = result["results"][0]["expanded_nodes"]
+        self.assertTrue(all(len(node) == 3 for node in nodes))
+
+    def test_checkpoint_roundtrip(self):
+        requests = [[(0, 0), (2, 1)], [(0, 0), (2, 0)]]
+        part = plan_batch(3, 2, [(1, 1)], requests,
+                          dynamic_costs=self.dynamic_costs,
+                          max_expanded=2, snapshot=True)
+        full = plan_batch(3, 2, [(1, 1)], requests,
+                          dynamic_costs=self.dynamic_costs,
+                          max_expanded=10 ** 9, trace=True)
+        for partial, expected in zip(part["results"], full["results"]):
+            if partial["status"] != "budget_exhausted":
+                self.assertNotIn("checkpoint", partial)
+                continue
+            checkpoint = partial["checkpoint"]
+            json.dumps(checkpoint)
+            self.assertIn("dynamic_costs", checkpoint)
+            resumed = resume(checkpoint, max_expanded=10 ** 9)
+            for key in ("path", "cost", "expanded", "status",
+                        "expanded_nodes"):
+                self.assertEqual(resumed[key], expected[key], key)
+
+
+class PlanMultiStartTests(unittest.TestCase):
+    def setUp(self):
+        self.dynamic_costs = [
+            [[1, 1, 1], [1, 1, 1]],
+            [[1, 9, 1], [1, 1, 1]],
+            [[1, 1, 9], [1, 1, 1]],
+            [[1, 1, 1], [1, 1, 1]],
+            [[1, 1, 1], [1, 1, 1]],
+        ]
+
+    def test_winner_follows_frame_costs(self):
+        # (2, 1) is the closer start statically, but entering (2, 0) at
+        # t == 1 costs 9, so the route from (0, 0) along the top row
+        # wins on dynamic accumulated cost.
+        dynamic_costs = [
+            [[1, 1, 1], [1, 1, 1]],
+            [[1, 1, 9], [1, 1, 1]],
+            [[1, 1, 1], [1, 1, 1]],
+        ]
+        result = plan_multi_start(3, 2, [], [(0, 0), (2, 1)], (2, 0),
+                                  dynamic_costs=dynamic_costs)
+        self.assertEqual(result["path"], [(0, 0), (1, 0), (2, 0)])
+        self.assertEqual(result["cost"], 2)
+
+    def test_trace_records_space_time_triples(self):
+        result = plan_multi_start(3, 2, [], [(0, 0), (2, 1)], (2, 0),
+                                  dynamic_costs=frames_all(3, 2, 1, 3),
+                                  trace=True)
+        self.assertTrue(all(len(node) == 3
+                            for node in result["expanded_nodes"]))
+        self.assertEqual(result["expanded"],
+                         len(result["expanded_nodes"]))
+
+    def test_replay_verifies_winning_path(self):
+        result = plan_multi_start(3, 2, [], [(0, 0), (2, 1)], (2, 0),
+                                  dynamic_costs=self.dynamic_costs)
+        checked = replay(3, 2, [], result["path"][0], (2, 0),
+                         result["path"], dynamic_costs=self.dynamic_costs)
+        self.assertEqual(checked, {"valid": True, "cost": result["cost"],
+                                   "steps": len(result["path"]) - 1})
+
+    def test_validation(self):
+        with self.assertRaises(TypeError):
+            plan_multi_start(3, 2, [], [(0, 0)], (2, 0), dynamic_costs=7)
+        with self.assertRaises(ValueError):
+            plan_multi_start(3, 2, [], [(0, 0)], (2, 0),
+                             dynamic_costs=[[[1, 0, 1]] * 2])
+        with self.assertRaises(ValueError):
+            plan_multi_start(3, 2, [], [(0, 0)], (2, 0),
+                             costs=[[1, 1, 1], [1, 1, 1]],
+                             dynamic_costs=self.dynamic_costs)
+
+    def test_max_cost_caps_dynamic_accumulation(self):
+        result = plan_multi_start(3, 2, [], [(0, 0)], (2, 0),
+                                  dynamic_costs=self.dynamic_costs,
+                                  max_cost=4)
+        self.assertEqual(result["status"], "found")
+        self.assertEqual(result["cost"], 4)
+        result = plan_multi_start(3, 2, [], [(0, 0)], (2, 0),
+                                  dynamic_costs=self.dynamic_costs,
+                                  max_cost=3)
+        self.assertEqual(result["status"], "cost_exhausted")
+        self.assertIsNone(result["path"])
+
+    def test_checkpoint_records_dynamic_costs_and_resumes(self):
+        dynamic_costs = [
+            [[1 + ((x + y + t) % 3) for x in range(4)] for y in range(3)]
+            for t in range(6)
+        ]
+        full = plan_multi_start(4, 3, [(1, 1)], [(0, 0), (3, 0)], (3, 2),
+                                dynamic_costs=dynamic_costs,
+                                trace=True, max_expanded=10 ** 9)
+        part = plan_multi_start(4, 3, [(1, 1)], [(0, 0), (3, 0)], (3, 2),
+                                dynamic_costs=dynamic_costs,
+                                max_expanded=2, snapshot=True)
+        self.assertEqual(part["status"], "budget_exhausted")
+        checkpoint = part["checkpoint"]
+        json.dumps(checkpoint)
+        self.assertEqual(checkpoint["dynamic_costs"],
+                         [[list(row) for row in frame]
+                          for frame in dynamic_costs])
+        resumed = resume(checkpoint, max_expanded=10 ** 9)
+        for key in ("path", "cost", "expanded", "status",
+                    "expanded_nodes"):
+            self.assertEqual(resumed[key], full[key], key)
+
+    def test_checkpoint_omits_field_without_dynamic_costs(self):
+        result = plan_multi_start(4, 3, [(1, 1)], [(0, 0)], (3, 2),
+                                  max_expanded=2, snapshot=True)
+        if "checkpoint" not in result:
+            self.skipTest("search finished before the budget stopped it")
+        self.assertNotIn("dynamic_costs", result["checkpoint"])
+
+    def test_corrupt_multi_start_dynamic_costs(self):
+        dynamic_costs = [
+            [[1 + ((x + y + t) % 3) for x in range(4)] for y in range(3)]
+            for t in range(6)
+        ]
+        part = plan_multi_start(4, 3, [(1, 1)], [(0, 0)], (3, 2),
+                                dynamic_costs=dynamic_costs,
+                                max_expanded=2, snapshot=True)
+        if "checkpoint" not in part:
+            self.skipTest("search finished before the budget stopped it")
+        checkpoint = json.loads(json.dumps(part["checkpoint"]))
+        bad_type = dict(checkpoint, dynamic_costs="nope")
+        with self.assertRaises(TypeError):
+            resume(bad_type)
+        bad_shape = dict(checkpoint, dynamic_costs=[[[1, 1, 1, 1]]])
+        with self.assertRaises(ValueError):
+            resume(bad_shape)
+        conflict = dict(checkpoint, costs=[[1] * 4 for _ in range(3)])
+        with self.assertRaises(ValueError):
+            resume(conflict)
+        inconsistent = json.loads(json.dumps(checkpoint))
+        inconsistent["dynamic_costs"][1] = [[99] * 4 for _ in range(3)]
+        with self.assertRaises(ValueError):
+            resume(inconsistent)
+
+
+class PlanKTests(unittest.TestCase):
+    def setUp(self):
+        self.dynamic_costs = [
+            [[1, 1, 1], [1, 1, 1]],
+            [[1, 9, 1], [1, 1, 1]],
+            [[1, 1, 9], [1, 1, 1]],
+            [[1, 1, 1], [1, 1, 1]],
+            [[1, 1, 1], [1, 1, 1]],
+        ]
+
+    def test_ranked_by_dynamic_accumulated_cost(self):
+        result = plan_k(3, 2, [], (0, 0), (2, 0), 3,
+                        dynamic_costs=self.dynamic_costs)
+        self.assertEqual(len(result["paths"]), 3)
+        self.assertEqual(result["costs"], sorted(result["costs"]))
+        # The first entry is the route ``plan`` would return.
+        best = plan(3, 2, [], (0, 0), (2, 0),
+                    dynamic_costs=self.dynamic_costs)
+        self.assertEqual(result["paths"][0], best["path"])
+        self.assertEqual(result["costs"][0], best["cost"])
+        # Costs are recomputed with the time-varying frames.
+        for path, cost in zip(result["paths"], result["costs"]):
+            checked = replay(3, 2, [], (0, 0), (2, 0), path,
+                             dynamic_costs=self.dynamic_costs)
+            self.assertTrue(checked["valid"])
+            self.assertEqual(checked["cost"], cost)
+
+    def test_paths_are_unique(self):
+        result = plan_k(3, 2, [], (0, 0), (2, 0), 5,
+                        dynamic_costs=self.dynamic_costs)
+        self.assertEqual(len(result["paths"]),
+                         len({tuple(p) for p in result["paths"]}))
+
+    def test_start_equals_goal(self):
+        result = plan_k(2, 2, [], (1, 1), (1, 1), 3,
+                        dynamic_costs=frames_all(2, 2, 2, 2))
+        self.assertEqual(result,
+                         {"paths": [[(1, 1)]], "costs": [0], "expanded": 1})
+
+    def test_unreachable(self):
+        result = plan_k(3, 1, [(1, 0)], (0, 0), (2, 0), 2,
+                        dynamic_costs=frames_all(3, 1, 1, 1))
+        self.assertEqual(result["paths"], [])
+        self.assertEqual(result["costs"], [])
+        self.assertNotIn("status", result)
+
+    def test_limits_keep_their_rules(self):
+        limited = plan_k(3, 2, [], (0, 0), (2, 0), 3,
+                         dynamic_costs=self.dynamic_costs, max_cost=4)
+        self.assertEqual(limited["status"], "found")
+        self.assertTrue(all(cost <= 4 for cost in limited["costs"]))
+        exhausted = plan_k(3, 2, [], (0, 0), (2, 0), 3,
+                           dynamic_costs=self.dynamic_costs, max_cost=3)
+        self.assertEqual(exhausted["status"], "cost_exhausted")
+        self.assertEqual(exhausted["paths"], [])
+        budgeted = plan_k(3, 2, [], (0, 0), (2, 0), 3,
+                          dynamic_costs=self.dynamic_costs, max_expanded=1)
+        self.assertEqual(budgeted["status"], "budget_exhausted")
+        self.assertEqual(budgeted["expanded"], 1)
+
+    def test_validation(self):
+        with self.assertRaises(TypeError):
+            plan_k(3, 2, [], (0, 0), (2, 0), 2, dynamic_costs="x")
+        with self.assertRaises(TypeError):
+            plan_k(3, 2, [], (0, 0), (2, 0), 2,
+                   dynamic_costs=[[[1, True, 1]] * 2])
+        with self.assertRaises(ValueError):
+            plan_k(3, 2, [], (0, 0), (2, 0), 2,
+                   dynamic_costs=[[[1, 1, 1]]])
+        with self.assertRaises(ValueError):
+            plan_k(3, 2, [], (0, 0), (2, 0), 2,
+                   dynamic_costs=[[[1, 0, 1]] * 2])
+        with self.assertRaises(ValueError):
+            plan_k(3, 2, [], (0, 0), (2, 0), 2,
+                   costs=[[1, 1, 1], [1, 1, 1]],
+                   dynamic_costs=self.dynamic_costs)
+
+    def test_validation_runs_after_k_check(self):
+        # A bad ``k`` is reported before the dynamic_costs structure is
+        # inspected.
+        with self.assertRaises(TypeError):
+            plan_k(3, 2, [], (0, 0), (2, 0), "x", dynamic_costs="x")
+        with self.assertRaises(ValueError):
+            plan_k(3, 2, [], (0, 0), (2, 0), 0, dynamic_costs="x")
 
 
 if __name__ == "__main__":

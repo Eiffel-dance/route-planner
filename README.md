@@ -140,3 +140,12 @@ Tests: python3 -m unittest discover -s tests -v
 - 启用后，路径在时间 `t`（即路径下标 `t`）进入坐标所付代价取第 `t` 帧该格数值；起点仍不计费，超过最后一帧后持续使用最后一帧。等待沿用既有规则（仅在提供的动态帧范围内生成）且不产生进入代价。规划在静态与动态障碍约束下返回全局最小总 `cost`；等价代价依旧按既有的终点与完整路径字典序裁决。`expanded` 与 `expanded_nodes` 只统计实际关闭的时空状态：不同历史不合并，不生成越界、障碍或非法重复节点；启用 `dynamic_costs` 后轨迹同样记录 `(x, y, t)` 三元组。
 - `max_cost` 按同一口径限制动态累计代价，沿用 `cost_exhausted` 与预算优先规则；`plan_any` 的获胜终点规则、`trace` 形态、`start == goal` 与不可达结果继续一致。`replay` 使用同一组帧代价重算 `cost`，合法路径的结果与规划一致；诊断错误类型与 `steps` 规则不变。
 - `snapshot=True` 产生的 checkpoint 以可 JSON 序列化结构保存 `dynamic_costs`（未提供时不新增该字段）、等待设置、累计状态与提供时的代价上限；`resume` 后的 `path`、`cost`、`expanded`、`status`、`trace` 及下一份 checkpoint 与一次不中断的调用逐项相同。`dynamic_costs` 相关的损坏快照分别报告 `TypeError` 或 `ValueError`，绝不静默降级。
+
+**预约时空路线（`reservations`）**
+- `plan`、`plan_any`、`plan_batch`、`plan_multi_start`、`plan_k` 与 `replay` 在末尾接受可选参数 `reservations=None`，用于多机器人协作；省略、为 `None` 或为空序列时与未启用完全等价：所有返回键、异常类型、校验顺序、扩展顺序与 tie-break 保持既有行为，现有调用无需迁移。
+- 否则 `reservations` 必须是非空坐标路径的序列，每条路径代表其他主体已经占用的时序路线。外层或某条路径不是可接受序列、坐标不是恰好两个整数时抛 `TypeError`；空路径、越界坐标、静态障碍坐标或同一路径内非连续的重复坐标抛 `ValueError`。路径中的连续停留予以保留；重复路线合并，条目的输入顺序不影响任何结果。所有校验在全部既有校验之后、搜索开始前完成（`plan_batch` 在任何请求被搜索之前）。
+- 路径第 `t` 个坐标在第 `t` 帧占用该顶点，超过末帧后持续占用末坐标；相邻坐标构成该帧的有向边。候选路线同一帧不得进入已预约顶点，也不得沿预约边的反向方向通行；候选路线仍受静态障碍、`dynamic_blocked`、`costs` 与 `dynamic_costs` 约束，仅提供 `reservations` 也会使搜索进入时空扩展模式。
+- `reservations` 存在时 `allow_wait=True` 允许在安全帧连续等待（下一帧该格既未被动态帧阻塞也未被预约）；等待不产生进入格代价，且只进入已提供的时间帧（动态障碍帧与预约路径帧各自提供帧范围）；离开某格后不得再次非连续进入。
+- 路径选择沿用动态模式裁决：先总 `cost`，再到达步数，再完整坐标序列字典序；`expanded` 只统计实际关闭的时空状态，`trace` 记录 `(x, y, t)` 三元组，不可达仍返回既有空路径结果；`start` 在第 0 帧被预约时不存在可行路线。
+- `max_expanded`、`max_cost`、`plan_k`、`plan_batch` 与 `plan_multi_start` 沿用各自的 `status`、截断与独立查询语义；`snapshot=True` 的 checkpoint 记录规范化后的 `reservations`（未提供时不新增该字段），`resume` 与一次未中断的搜索逐字段一致，损坏的 `reservations` 快照分别报告 `TypeError` 或 `ValueError`。
+- `replay` 在相同预约下重算成功路径的 `cost` 与 `steps`；`diagnose=True` 时对顶点冲突返回 `reservation_vertex`、对反向边冲突返回 `reservation_edge`，并给出首次违规元素的索引，其他非法路径继续使用既有固定结构与错误码。

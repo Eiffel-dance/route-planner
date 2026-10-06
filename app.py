@@ -670,7 +670,8 @@ Validation (all performed before the search starts):
 import heapq
 from collections.abc import Iterable, Sequence
 
-__all__ = ["plan", "plan_any", "plan_k", "plan_batch", "plan_multi_start",
+__all__ = ["plan", "plan_any", "plan_k", "plan_batch", "plan_agents",
+           "plan_multi_start",
            "replay", "resume", "distance_field", "distance_field_any"]
 
 # Fixed neighbor generation order: +x, -x, +y, -y.
@@ -952,6 +953,26 @@ def _reservation_frames(paths):
         vertex_frames.append(frozenset(vertices))
         edge_frames.append(frozenset(edges))
     return vertex_frames, edge_frames
+
+
+def _goal_not_before(paths, goal):
+    # The earliest frame at which a route may enter ``goal`` and then
+    # occupy it forever, given that every path in ``paths`` keeps its own
+    # final coordinate past its last frame: the frame after the last one
+    # in which any of ``paths`` occupies the cell. ``None`` when no path
+    # ever occupies it (no extra constraint); ``float("inf")`` when it is
+    # some path's final coordinate, whose occupancy persists, so no
+    # arrival can ever be safe.
+    latest = None
+    for path in paths:
+        if path[-1] == goal:
+            return float("inf")
+        for t in range(len(path) - 1, -1, -1):
+            if path[t] == goal:
+                if latest is None or t > latest:
+                    latest = t
+                break
+    return None if latest is None else latest + 1
 
 
 def _wait_horizon(frames, vertex_frames):
@@ -1260,7 +1281,7 @@ def _search_static(width, height, obstacles, start, goal, costs, trace,
 def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
                     trace, max_expanded, max_cost=None, snapshot=False,
                     allow_wait=False, state=None, cost_frames=None,
-                    reservations=None):
+                    reservations=None, goal_not_before=None):
     """History-sensitive time-expanded A*.
 
     Frame ``t`` constrains the cell occupied at path index ``t``; frames
@@ -1294,7 +1315,12 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
     for one frame at no entering-cell cost, generated only while the next
     time step still lies within the provided frames and the cell is free
     there; consecutive waits repeat the coordinate in the path, and once
-    a cell is left it may never be re-entered. With ``snapshot=True`` a
+    a cell is left it may never be re-entered. With ``goal_not_before``
+    (used by ``plan_agents``) a route may not enter the goal cell before
+    that frame, because a reserved route still occupies it at some later
+    frame and the goal cell stays occupied once the route ends; such
+    candidates are never generated, exactly like reserved vertices.
+    With ``snapshot=True`` a
     budget stop additionally
     returns a checkpoint of the complete route-tree state; ``state``
     carries such a snapshot back in for ``resume``.
@@ -1364,6 +1390,10 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
             # The root itself would occupy a reserved vertex at frame 0,
             # so no feasible route exists.
             open_heap = []
+        elif goal_not_before is not None and start == goal:
+            # The single-point route would occupy the goal cell from
+            # frame 0 on, but a reserved route still needs it later.
+            open_heap = []
         else:
             open_heap = [(h0, h0, start[0], start[1], 0, 0, start_path,
                           frozenset(start_path))]
@@ -1420,6 +1450,12 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
                 continue  # static obstacle, timed obstacle, or revisit
             if nxt in reserved:
                 continue  # vertex another agent occupies at frame next_t
+            if (goal_not_before is not None and nxt == goal
+                    and next_t < goal_not_before):
+                # A reserved route still occupies the goal cell at some
+                # frame at or after ``next_t``; a route ending there now
+                # would keep the cell forever and be violated later.
+                continue
             if (nxt, (x, y)) in reserved_edges(t):
                 continue  # reverse of a reserved edge on this transition
             new_g = g + step_cost(nxt, next_t)
@@ -3932,6 +3968,111 @@ def plan_batch(width, height, blocked, requests, costs=None, trace=False,
                 max_expanded, max_cost, snapshot, allow_wait
             ))
     return {"results": results}
+
+
+def plan_agents(width, height, blocked, requests, costs=None, trace=False,
+                dynamic_blocked=None, allow_wait=False, dynamic_costs=None,
+                reservations=None):
+    # --- Validation: ``plan``'s shared checks in their usual order,    ---
+    # --- with ``requests`` occupying the position of ``start``/``goal``---
+    # --- in that sequence. Every check is decided before any search    ---
+    # --- begins, so an invalid batch never returns partial results.    ---
+    width = _validate_dimension(width, "width")
+    height = _validate_dimension(height, "height")
+    pairs = _normalize_requests(requests)
+    for index, (start, goal) in enumerate(pairs):
+        _check_bounds(start, width, height, f"requests[{index}] start")
+        _check_bounds(goal, width, height, f"requests[{index}] goal")
+    obstacles = _normalize_blocked(blocked, width, height)
+    for index, (start, goal) in enumerate(pairs):
+        if start in obstacles:
+            raise ValueError(
+                f"requests[{index}] start {start} lies on a blocked cell"
+            )
+        if goal in obstacles:
+            raise ValueError(
+                f"requests[{index}] goal {goal} lies on a blocked cell"
+            )
+    costs = _normalize_costs(costs, width, height)
+    if not isinstance(trace, bool):
+        raise TypeError(
+            f"trace must be a bool, got {type(trace).__name__}"
+        )
+    frames = _normalize_dynamic_blocked(dynamic_blocked, width, height)
+    if frames is not None:
+        for index, (start, _) in enumerate(pairs):
+            if start in frames[0]:
+                raise ValueError(
+                    f"requests[{index}] start {start} is blocked at "
+                    f"frame 0"
+                )
+    # The waiting flag keeps ``plan``'s position right after the
+    # dynamic-frame checks; the time-varying cost frames follow every
+    # pre-existing check, still before any agent is searched; providing
+    # both ``costs`` and ``dynamic_costs`` is a ``ValueError``.
+    _validate_allow_wait(allow_wait)
+    cost_frames = _normalize_dynamic_costs(dynamic_costs, width, height)
+    if cost_frames is not None and costs is not None:
+        raise ValueError(
+            "costs and dynamic_costs cannot both be provided"
+        )
+    # The reserved routes follow every pre-existing check, before any
+    # agent is searched.
+    reservation_paths = _normalize_reservations(
+        reservations, width, height, obstacles
+    )
+    # Prioritized planning in request order: every agent is searched
+    # exactly as ``plan`` would search it, except that the routes already
+    # assigned to earlier agents are added to the reservations, so a
+    # later route never enters a vertex an earlier route occupies at the
+    # same frame, never traverses the reverse of an earlier route's
+    # directed edge, and every earlier goal stays occupied past its
+    # final frame. Since a route keeps its own goal cell forever once it
+    # ends, an agent may also not end its route on a cell a reserved
+    # route still needs at some later frame: ``goal_not_before`` pushes
+    # its arrival past the last such frame (or makes the goal
+    # unreachable when the cell is a reserved route's final coordinate).
+    # The input order fixes the priority and duplicate
+    # requests are kept. The first agent whose search comes back empty
+    # stops the batch immediately: later agents are never searched and
+    # the batch is reported ``unreachable`` with the failing index.
+    results = []
+    planned = []
+    total_expanded = 0
+    for index, (start, goal) in enumerate(pairs):
+        if planned:
+            effective = (reservation_paths or ()) + tuple(planned)
+        else:
+            effective = reservation_paths
+        if (frames is not None or cost_frames is not None
+                or effective is not None):
+            result = _search_dynamic(
+                width, height, obstacles, frames, start, goal, costs,
+                trace, None, None, False, allow_wait,
+                cost_frames=cost_frames, reservations=effective,
+                goal_not_before=(_goal_not_before(effective, goal)
+                                 if effective is not None else None)
+            )
+        else:
+            result = _search_static(
+                width, height, obstacles, start, goal, costs, trace,
+                None, None, False, allow_wait
+            )
+        results.append(result)
+        total_expanded += result["expanded"]
+        if result["path"] is None:
+            return {
+                "status": "unreachable",
+                "failed_index": index,
+                "results": results,
+                "expanded": total_expanded,
+            }
+        planned.append(tuple(result["path"]))
+    return {
+        "status": "found",
+        "results": results,
+        "expanded": total_expanded,
+    }
 
 
 def plan_multi_start(width, height, blocked, starts, goal, costs=None,

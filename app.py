@@ -887,6 +887,7 @@ __all__ = ["plan", "plan_any", "plan_k", "plan_batch", "plan_agents",
            "plan_multi_start",
            "replay", "resume", "distance_field", "distance_field_any",
            "verify_trace", "verify_any_trace", "verify_batch_trace",
+           "verify_multi_start_trace",
            "verify_agents"]
 
 # Fixed neighbor generation order: +x, -x, +y, -y.
@@ -6572,3 +6573,101 @@ def verify_agents(width, height, blocked, requests, record, costs=None,
         "mismatch": None,
         "index": None,
     }
+
+
+def verify_multi_start_trace(width, height, blocked, starts, goal, record,
+                             costs=None, dynamic_blocked=None,
+                             max_expanded=None, snapshot=False,
+                             max_cost=None, allow_wait=False,
+                             dynamic_costs=None, reservations=None,
+                             max_steps=None):
+    # --- Validation: ``plan_multi_start``'s public checks in their     ---
+    # --- exact order (only the never-present ``trace`` flag is         ---
+    # --- skipped; the audit always recomputes with the trace on). The  ---
+    # --- record is inspected only after every grid and constraint      ---
+    # --- check has run, so a missing or malformed record never skips   ---
+    # --- a grid, starts or constraint error and a failed check never   ---
+    # --- starts a search.                                              ---
+    width = _validate_dimension(width, "width")
+    height = _validate_dimension(height, "height")
+    start_points = _normalize_starts(starts)
+    goal = _normalize_point(goal, "goal")
+    for point in start_points:
+        _check_bounds(point, width, height, "start")
+    _check_bounds(goal, width, height, "goal")
+    obstacles = _normalize_blocked(blocked, width, height)
+    for point in start_points:
+        if point in obstacles:
+            raise ValueError(f"start {point} lies on a blocked cell")
+    if goal in obstacles:
+        raise ValueError(f"goal {goal} lies on a blocked cell")
+    costs = _normalize_costs(costs, width, height)
+    frames = _normalize_dynamic_blocked(dynamic_blocked, width, height)
+    if frames is not None:
+        for point in start_points:
+            if point in frames[0]:
+                raise ValueError(f"start {point} is blocked at frame 0")
+    # The waiting flag, the budget, the snapshot flag, the cost limit,
+    # the time-varying cost frames, the reserved routes and the step
+    # window keep exactly ``plan_multi_start``'s positions; every check
+    # is decided before the record is inspected and before the audit
+    # search starts. Note that ``plan_multi_start`` checks the trace
+    # flag before the dynamic frames; the audit has no trace parameter,
+    # so that check is simply absent.
+    _validate_allow_wait(allow_wait)
+    _validate_budget(max_expanded)
+    _validate_snapshot_flag(snapshot)
+    _validate_max_cost(max_cost)
+    cost_frames = _normalize_dynamic_costs(dynamic_costs, width, height)
+    if cost_frames is not None and costs is not None:
+        raise ValueError(
+            "costs and dynamic_costs cannot both be provided"
+        )
+    reservation_paths = _normalize_reservations(
+        reservations, width, height, obstacles
+    )
+    _validate_max_steps(max_steps)
+    dynamic = (frames is not None or cost_frames is not None
+               or reservation_paths is not None)
+    # The merged multi-source static search closes each coordinate at
+    # most once, so a repeated pair in a recorded static trace is a
+    # malformed record; the dynamic route tree records one triple per
+    # closed history state.
+    saved = _restore_record(record, dynamic, width, height)
+    # --- Audit: recompute the deterministic multi-source result with  ---
+    # --- the trace on and compare field by field in the fixed order.  ---
+    # --- Lists and tuples compare equal (JSON round trips), extra     ---
+    # --- record fields are ignored, and nothing of the recomputation  ---
+    # --- or the comparison modifies the record.                       ---
+    if dynamic:
+        result = _search_multi_dynamic(
+            width, height, obstacles, frames, start_points, goal, costs,
+            True, max_expanded, max_cost, snapshot, allow_wait,
+            cost_frames=cost_frames, reservations=reservation_paths,
+            max_steps=max_steps
+        )
+    else:
+        result = _search_multi_static(
+            width, height, obstacles, start_points, goal, costs, True,
+            max_expanded, max_cost, snapshot, allow_wait,
+            max_steps=max_steps
+        )
+    index = _first_difference(saved["path"], result["path"])
+    if index is not None:
+        return {"valid": False, "mismatch": "path", "index": index}
+    if saved["cost"] != result["cost"]:
+        return {"valid": False, "mismatch": "cost", "index": None}
+    if saved["expanded"] != result["expanded"]:
+        return {"valid": False, "mismatch": "expanded", "index": None}
+    index = _first_difference(saved["expanded_nodes"],
+                              result["expanded_nodes"])
+    if index is not None:
+        return {"valid": False, "mismatch": "expanded_nodes",
+                "index": index}
+    if "status" in result and saved["status"] != result["status"]:
+        return {"valid": False, "mismatch": "status", "index": None}
+    if ("checkpoint" in result
+            and _canonical_json(saved["checkpoint"])
+            != _canonical_json(result["checkpoint"])):
+        return {"valid": False, "mismatch": "checkpoint", "index": None}
+    return {"valid": True, "mismatch": None, "index": None}

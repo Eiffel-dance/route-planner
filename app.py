@@ -5314,7 +5314,7 @@ def plan_batch(width, height, blocked, requests, costs=None, trace=False,
 
 def plan_agents(width, height, blocked, requests, costs=None, trace=False,
                 dynamic_blocked=None, allow_wait=False, dynamic_costs=None,
-                reservations=None):
+                reservations=None, max_expanded=None):
     # --- Validation: ``plan``'s shared checks in their usual order,    ---
     # --- with ``requests`` occupying the position of ``start``/``goal``---
     # --- in that sequence. Every check is decided before any search    ---
@@ -5363,6 +5363,13 @@ def plan_agents(width, height, blocked, requests, costs=None, trace=False,
     reservation_paths = _normalize_reservations(
         reservations, width, height, obstacles
     )
+    # The optional shared expansion budget is validated last of all,
+    # after every grid, requests, frame, waiting, time-varying cost and
+    # reservation check, still before any agent is searched: it must be a
+    # non-negative, non-bool integer (other types raise ``TypeError`` and
+    # negative values raise ``ValueError``); ``None`` leaves every
+    # previous behavior untouched.
+    _validate_budget(max_expanded)
     # Prioritized planning in request order: every agent is searched
     # exactly as ``plan`` would search it, except that the routes already
     # assigned to earlier agents are added to the reservations, so a
@@ -5377,7 +5384,17 @@ def plan_agents(width, height, blocked, requests, costs=None, trace=False,
     # The input order fixes the priority and duplicate
     # requests are kept. The first agent whose search comes back empty
     # stops the batch immediately: later agents are never searched and
-    # the batch is reported ``unreachable`` with the failing index.
+    # the batch is reported ``unreachable`` with the failing index. When
+    # a shared ``max_expanded`` budget is given, all agents draw from one
+    # cumulative allowance: each agent is searched with only the budget
+    # its predecessors left unspent, so every static or spatiotemporal
+    # node actually closed (including waits) counts against the same
+    # total. An agent that reaches its goal within the remaining budget
+    # keeps its route and the next request is searched; an agent that
+    # runs out before finishing is reported ``budget_exhausted`` (its
+    # own ``path``/``cost`` are ``None``) and stops the batch with the
+    # same status and the current index, while a search whose candidates
+    # run out naturally is still plain ``unreachable``.
     results = []
     planned = []
     total_expanded = 0
@@ -5386,11 +5403,13 @@ def plan_agents(width, height, blocked, requests, costs=None, trace=False,
             effective = (reservation_paths or ()) + tuple(planned)
         else:
             effective = reservation_paths
+        remaining = (max_expanded - total_expanded
+                     if max_expanded is not None else None)
         if (frames is not None or cost_frames is not None
                 or effective is not None):
             result = _search_dynamic(
                 width, height, obstacles, frames, start, goal, costs,
-                trace, None, None, False, allow_wait,
+                trace, remaining, None, False, allow_wait,
                 cost_frames=cost_frames, reservations=effective,
                 goal_not_before=(_goal_not_before(effective, goal)
                                  if effective is not None else None)
@@ -5398,11 +5417,22 @@ def plan_agents(width, height, blocked, requests, costs=None, trace=False,
         else:
             result = _search_static(
                 width, height, obstacles, start, goal, costs, trace,
-                None, None, False, allow_wait
+                remaining, None, False, allow_wait
             )
         results.append(result)
         total_expanded += result["expanded"]
         if result["path"] is None:
+            if (max_expanded is not None
+                    and result.get("status") == "budget_exhausted"):
+                # Live candidates remained when the shared budget ran
+                # out: keep the successful prefix and the current item,
+                # never search the later requests.
+                return {
+                    "status": "budget_exhausted",
+                    "failed_index": index,
+                    "results": results,
+                    "expanded": total_expanded,
+                }
             return {
                 "status": "unreachable",
                 "failed_index": index,

@@ -73,7 +73,7 @@ Tests: python3 -m unittest discover -s tests -v
 - `trace=True` 时静态模式记录唯一坐标关闭序列、动态模式记录 `(x, y, t)` 关闭序列，且 `expanded == len(expanded_nodes)`。`starts` 含 `goal` 时按 `plan` 的 `start == goal` 单点零代价规则处理（零预算同样为 `budget_exhausted`）。
 - `max_expanded` 与 `max_cost` 沿用 `plan` 的 `status` 与预算优先规则：超代价候选丢弃且不计入 `expanded`，二者均不改变无上限路线与 tie-break。`snapshot=True` 因预算耗尽返回可 JSON 序列化的 `checkpoint`（记录排序后的 `starts`、网格约束、动态帧、提供时的代价上限与待处理状态），`resume` 按累计预算、不重复计数、仅再次预算耗尽才返回新 `checkpoint` 的规则继续搜索，非法 `checkpoint` 沿用 `resume` 既有的 `TypeError`/`ValueError` 边界。
 
-`plan_agents(width, height, blocked, requests, costs=None, trace=False, dynamic_blocked=None, allow_wait=False, dynamic_costs=None, reservations=None)` 在一次调用中为多台代理生成互不冲突的路线：按 `requests` 的输入顺序逐台规划，每台沿用 `plan` 的搜索规则，后续代理把前面已确定的路线（连同外部 `reservations`）作为时空约束避让；全部成功时返回 `{"status": "found", "results": [...], "expanded"}`。
+`plan_agents(width, height, blocked, requests, costs=None, trace=False, dynamic_blocked=None, allow_wait=False, dynamic_costs=None, reservations=None, max_expanded=None)` 在一次调用中为多台代理生成互不冲突的路线：按 `requests` 的输入顺序逐台规划，每台沿用 `plan` 的搜索规则，后续代理把前面已确定的路线（连同外部 `reservations`）作为时空约束避让；全部成功时返回 `{"status": "found", "results": [...], "expanded"}`。
 
 **多代理规划（`plan_agents`）**
 - 共享参数（尺寸、`blocked`、`costs`、`trace`、`dynamic_blocked`、`allow_wait`、`dynamic_costs`、`reservations`）沿用 `plan` 的校验规则与顺序；`requests` 在校验序列中占据 `start`/`goal` 的位置，规则与 `plan_batch` 相同：必须是非空序列（`None`、字符串、字节串或其他非序列抛 `TypeError`，空序列抛 `ValueError`），每项恰好是 `[start, goal]` 两个坐标（元素形状或坐标类型错误抛 `TypeError`；坐标越界、端点落在静态障碍上、动态第 0 帧阻塞某个起点抛 `ValueError`）。同时提供 `costs` 与 `dynamic_costs` 抛 `ValueError`。全部校验在任意搜索开始前完成，非法批次绝不返回部分结果。
@@ -81,6 +81,8 @@ Tests: python3 -m unittest discover -s tests -v
 - 路线到达终点后持续占用该格，因此代理不得把终点停在任何已确定路线或外部预约随后仍会经过或占据的格子上：终点最早可进入帧为已确定路线最后占用该格的下一帧；若终点是某条已确定路线或预约的末坐标（占用持久化），该代理不存在可行路线。
 - 全部成功时返回 `status` 为 `"found"`；`results` 按请求顺序逐项给出 `{"path", "cost", "expanded"}`，`trace=True` 时每项额外携带 `expanded_nodes`（按该次搜索的模式记录：静态为坐标二元组，时空模式为 `(x, y, t)` 三元组），且每项 `expanded == len(expanded_nodes)`；顶层 `expanded` 为各项之和。
 - 首个无路的代理使整批立即停止：返回 `status` 为 `"unreachable"`、`failed_index` 为该代理的下标，`results` 只含已成功项与失败项（失败项 `path`/`cost` 为 `None`，仍含 `expanded`，`trace` 时含 `expanded_nodes`），后续代理不再搜索，顶层 `expanded` 只累计已尝试代理实际关闭的节点数，整批不得标为成功。
+- 可选 `max_expanded` 省略或为 `None` 时返回结构、请求优先级、冲突规避、路径选择与异常行为逐项不变。提供时必须是非负且非布尔的整数：其他类型抛 `TypeError`，负数抛 `ValueError`；该校验在全部既有网格、`requests`、障碍、`costs`、`trace`、动态帧、`allow_wait`、`dynamic_costs` 与 `reservations` 校验完成之后、任何代理开始搜索之前进行，非法批次绝不返回部分结果。
+- 提供预算时所有代理共享同一个累计上限：每次实际关闭的静态节点或时空节点（含等待）都计入同一总数，每个代理只在剩余预算内沿用 `plan` 的 tie-break 搜索，并把此前路线作为预约约束。代理在剩余预算内关闭终点时其结果 `status` 为 `"found"`（恰好以最后一份预算关闭终点也算成功）并继续下一个请求；若候选自然耗尽仍无路，沿用 `"unreachable"` 与 `failed_index`；若尚有候选但预算在当前代理完成前耗尽，其 `path`/`cost` 为 `None`、`status` 为 `"budget_exhausted"`、`expanded` 只计实际关闭数，整批返回 `status` 为 `"budget_exhausted"`、`failed_index` 为当前下标，`results` 保留此前成功项及当前项，顶层 `expanded` 为累计关闭数，后续请求不再搜索。提供预算时每个已搜索代理的结果都携带与 `plan` 一致的 `status`，`trace` 只记录实际关闭节点，零预算即使 `start == goal` 也为 `"budget_exhausted"`，整个返回对象可 JSON 序列化。
 - 每条成功路线以其对应 `goal` 结尾，可逐条以相同参数交给 `replay` 离线核验并得到相同 `cost` 与 `steps`；任意两条成功路线之间（含终点持续占用）不存在同帧顶点冲突或反向换边。整个返回对象可 JSON 序列化保存。
 
 `distance_field(width, height, blocked, goal, costs=None, trace=False)` 与 `distance_field_any(width, height, blocked, goals, costs=None, trace=False)` 是面向静态栅格的离线分析入口：一次分析给出到单个或多个候选终点的最低代价场；不接受 `start`、`dynamic_blocked`、`max_expanded`、`max_cost`、`snapshot` 或其他控制参数，也不生成 `status`。

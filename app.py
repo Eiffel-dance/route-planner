@@ -36,7 +36,11 @@ allow_wait=False, dynamic_costs=None, reservations=None, max_steps=None)``
 and
 ``verify_agents(width, height, blocked, requests, record, costs=None,
 dynamic_blocked=None, allow_wait=False, dynamic_costs=None,
-reservations=None)``.
+reservations=None)`` and
+``verify_multi_start_trace(width, height, blocked, starts, goal, record,
+costs=None, dynamic_blocked=None, max_expanded=None, snapshot=False,
+max_cost=None, allow_wait=False, dynamic_costs=None, reservations=None,
+max_steps=None)``.
 
 Semantics:
 - Four-neighborhood moves, Manhattan heuristic. Without ``costs`` each step
@@ -840,6 +844,49 @@ Multi-agent offline audit (``verify_agents``):
   waiting, time-varying costs and reservations, and the report is
   JSON-serializable.
 
+Multi-start offline audit (``verify_multi_start_trace``):
+- ``verify_multi_start_trace(width, height, blocked, starts, goal, record,
+  costs=None, dynamic_blocked=None, max_expanded=None, snapshot=False,
+  max_cost=None, allow_wait=False, dynamic_costs=None,
+  reservations=None, max_steps=None)`` checks a saved
+  ``plan_multi_start`` result against the deterministic result the same
+  arguments produce, without exposing the recomputation. ``record`` may
+  be the dict a ``trace=True`` ``plan_multi_start`` call returned or its
+  JSON round-tripped equivalent: coordinates may be lists or tuples, key
+  order is irrelevant and extra keys are ignored. The grid, ``starts``,
+  ``goal``, costs, dynamic-frame, waiting, budget, snapshot, cost-limit,
+  time-varying cost, reservation and step-window arguments are validated
+  first, in exactly ``plan_multi_start``'s public order and with its
+  exception types (only the never-present ``trace`` flag is skipped; the
+  audit always recomputes with the trace on); only then is the record
+  inspected, so a missing or malformed record never skips a grid or
+  starts error.
+- The record follows ``verify_trace``'s record rules: it must be an
+  object carrying at least ``path``, ``cost``, ``expanded`` and
+  ``expanded_nodes`` with the static/dynamic mode arity the arguments
+  select (coordinate pairs in static mode, ``(x, y, t)`` triples in
+  dynamic mode, and no state recorded twice by the merged static search,
+  which closes every coordinate at most once). A record that is not an
+  object, lacks a required field, has a wrongly typed field or a wrongly
+  shaped trajectory entry raises ``TypeError``; an out-of-bounds
+  coordinate, a trajectory entry inconsistent with the mode, a negative
+  time, a duplicated static state or an invalid checkpoint structure
+  raises ``ValueError``. Every such check is decided before the audit
+  search starts, and the record is never modified.
+- A structurally legal record never raises: the deterministic
+  multi-start result is recomputed with the trace on -- same tie-breaks,
+  start merging, cost accumulation, persistent dynamic frames, waiting,
+  budget, cost-limit, step-window and snapshot semantics -- and compared
+  field by field. The report is exactly ``{"valid": bool, "mismatch":
+  ..., "index": ...}``: the first differing field in the fixed order
+  ``path``, ``cost``, ``expanded``, ``expanded_nodes``, ``status``,
+  ``checkpoint``; a path or trajectory difference also gives the
+  zero-based index of the first differing element, every other
+  difference reports ``index`` ``None``. A fully consistent record
+  returns ``valid`` true with ``mismatch`` and ``index`` both ``None``.
+  Success, unreachable, budget-, cost- and step-truncated results are
+  audited, and the report is JSON-serializable.
+
 Validation (all performed before the search starts):
 - ``width``/``height`` must be positive integers.
 - ``start``, ``goal`` and every entry of ``blocked`` must be grid
@@ -887,7 +934,7 @@ __all__ = ["plan", "plan_any", "plan_k", "plan_batch", "plan_agents",
            "plan_multi_start",
            "replay", "resume", "distance_field", "distance_field_any",
            "verify_trace", "verify_any_trace", "verify_batch_trace",
-           "verify_agents"]
+           "verify_agents", "verify_multi_start_trace"]
 
 # Fixed neighbor generation order: +x, -x, +y, -y.
 _NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1))
@@ -6321,6 +6368,99 @@ def verify_any_trace(width, height, blocked, start, goals, record,
         cost_frames=cost_frames, reservations=reservation_paths,
         max_steps=max_steps
     )
+    index = _first_difference(saved["path"], result["path"])
+    if index is not None:
+        return {"valid": False, "mismatch": "path", "index": index}
+    if saved["cost"] != result["cost"]:
+        return {"valid": False, "mismatch": "cost", "index": None}
+    if saved["expanded"] != result["expanded"]:
+        return {"valid": False, "mismatch": "expanded", "index": None}
+    index = _first_difference(saved["expanded_nodes"],
+                              result["expanded_nodes"])
+    if index is not None:
+        return {"valid": False, "mismatch": "expanded_nodes",
+                "index": index}
+    if "status" in result and saved["status"] != result["status"]:
+        return {"valid": False, "mismatch": "status", "index": None}
+    if ("checkpoint" in result
+            and _canonical_json(saved["checkpoint"])
+            != _canonical_json(result["checkpoint"])):
+        return {"valid": False, "mismatch": "checkpoint", "index": None}
+    return {"valid": True, "mismatch": None, "index": None}
+
+
+def verify_multi_start_trace(width, height, blocked, starts, goal, record,
+                             costs=None, dynamic_blocked=None,
+                             max_expanded=None, snapshot=False, max_cost=None,
+                             allow_wait=False, dynamic_costs=None,
+                             reservations=None, max_steps=None):
+    # --- Validation: ``plan_multi_start``'s public checks in their exact ---
+    # --- order (``starts`` takes ``start``'s position; only the          ---
+    # --- never-present ``trace`` flag is skipped, since the audit always ---
+    # --- recomputes with the trace on). The record is inspected only     ---
+    # --- after every grid and constraint check has run, so a missing or  ---
+    # --- malformed record never skips a grid or starts error and a       ---
+    # --- failed check never starts a search or returns a partial report. ---
+    width = _validate_dimension(width, "width")
+    height = _validate_dimension(height, "height")
+    start_points = _normalize_starts(starts)
+    goal = _normalize_point(goal, "goal")
+    for point in start_points:
+        _check_bounds(point, width, height, "start")
+    _check_bounds(goal, width, height, "goal")
+    obstacles = _normalize_blocked(blocked, width, height)
+    for point in start_points:
+        if point in obstacles:
+            raise ValueError(f"start {point} lies on a blocked cell")
+    if goal in obstacles:
+        raise ValueError(f"goal {goal} lies on a blocked cell")
+    costs = _normalize_costs(costs, width, height)
+    frames = _normalize_dynamic_blocked(dynamic_blocked, width, height)
+    if frames is not None:
+        for point in start_points:
+            if point in frames[0]:
+                raise ValueError(f"start {point} is blocked at frame 0")
+    # The waiting flag, the budget, the snapshot flag, the cost limit,
+    # the time-varying cost frames and the reserved routes keep exactly
+    # ``plan_multi_start``'s positions; every check is decided before the
+    # record is inspected and before the audit search starts.
+    _validate_allow_wait(allow_wait)
+    _validate_budget(max_expanded)
+    _validate_snapshot_flag(snapshot)
+    _validate_max_cost(max_cost)
+    cost_frames = _normalize_dynamic_costs(dynamic_costs, width, height)
+    if cost_frames is not None and costs is not None:
+        raise ValueError(
+            "costs and dynamic_costs cannot both be provided"
+        )
+    reservation_paths = _normalize_reservations(
+        reservations, width, height, obstacles
+    )
+    _validate_max_steps(max_steps)
+    dynamic = (frames is not None or cost_frames is not None
+               or reservation_paths is not None)
+    # The merged multi-source static search closes every coordinate at
+    # most once (exactly like ``plan``'s static search), so a repeated
+    # pair in the recorded static trace is a malformed record.
+    saved = _restore_record(record, dynamic, width, height)
+    # --- Audit: recompute the deterministic multi-start result with the ---
+    # --- trace on and compare field by field in the fixed order. Lists  ---
+    # --- and tuples compare equal (JSON round trips), extra record      ---
+    # --- fields are ignored, and nothing of the recomputation or the    ---
+    # --- comparison modifies the record.                                ---
+    if dynamic:
+        result = _search_multi_dynamic(
+            width, height, obstacles, frames, start_points, goal, costs,
+            True, max_expanded, max_cost, snapshot, allow_wait,
+            cost_frames=cost_frames, reservations=reservation_paths,
+            max_steps=max_steps
+        )
+    else:
+        result = _search_multi_static(
+            width, height, obstacles, start_points, goal, costs, True,
+            max_expanded, max_cost, snapshot, allow_wait,
+            max_steps=max_steps
+        )
     index = _first_difference(saved["path"], result["path"])
     if index is not None:
         return {"valid": False, "mismatch": "path", "index": index}

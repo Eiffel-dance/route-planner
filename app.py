@@ -2,33 +2,36 @@
 
 Public entry points: ``plan(width, height, blocked, start, goal, costs=None,
 trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False,
-max_cost=None, allow_wait=False, dynamic_costs=None, reservations=None)``,
+max_cost=None, allow_wait=False, dynamic_costs=None, reservations=None,
+max_steps=None)``,
 ``plan_any(width, height, blocked,
 start, goals, costs=None, trace=False, dynamic_blocked=None,
 max_expanded=None, snapshot=False, max_cost=None, allow_wait=False,
-dynamic_costs=None, reservations=None)``,
+dynamic_costs=None, reservations=None, max_steps=None)``,
 ``plan_k(width, height, blocked, start, goal, k, costs=None,
 dynamic_blocked=None, max_expanded=None, max_cost=None,
-allow_wait=False, dynamic_costs=None, reservations=None)``,
+allow_wait=False, dynamic_costs=None, reservations=None, max_steps=None)``,
 ``plan_batch(width, height, blocked, requests, costs=None, trace=False,
 dynamic_blocked=None, max_expanded=None, snapshot=False,
-max_cost=None, allow_wait=False, dynamic_costs=None, reservations=None)``,
+max_cost=None, allow_wait=False, dynamic_costs=None, reservations=None,
+max_steps=None)``,
 ``plan_multi_start(width, height, blocked, starts, goal, costs=None,
 trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False,
-max_cost=None, allow_wait=False, dynamic_costs=None, reservations=None)``,
+max_cost=None, allow_wait=False, dynamic_costs=None, reservations=None,
+max_steps=None)``,
 ``replay(width, height, blocked, start, goal, path, costs=None,
 dynamic_blocked=None, diagnose=False, allow_wait=False,
-dynamic_costs=None, reservations=None)``,
+dynamic_costs=None, reservations=None, max_steps=None)``,
 ``resume(checkpoint, max_expanded=None)``,
 ``distance_field(width, height, blocked, goal, costs=None, trace=False)``,
 ``distance_field_any(width, height, blocked, goals, costs=None,
 trace=False)`` and
 ``verify_trace(width, height, blocked, start, goal, record, costs=None,
 dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None,
-allow_wait=False, dynamic_costs=None, reservations=None)`` and
+allow_wait=False, dynamic_costs=None, reservations=None, max_steps=None)`` and
 ``verify_batch_trace(width, height, blocked, requests, record, costs=None,
 dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None,
-allow_wait=False, dynamic_costs=None, reservations=None)`` and
+allow_wait=False, dynamic_costs=None, reservations=None, max_steps=None)`` and
 ``verify_agents(width, height, blocked, requests, record, costs=None,
 dynamic_blocked=None, allow_wait=False, dynamic_costs=None,
 reservations=None)``.
@@ -111,6 +114,57 @@ Cost limit (``max_cost``):
   for negative values or a state inconsistent with the limit) before any
   searching, and a resumed search is equivalent to one uninterrupted call
   with the same limit. ``replay`` accepts no ``max_cost`` parameter.
+
+Step limit (``max_steps``):
+- ``max_steps`` may be omitted or ``None`` (disabled), which keeps every
+  key, value, path choice, expansion order, exception type and tie-break
+  of the default behavior untouched. Otherwise it must be a non-negative
+  integer that is not a bool: other types raise ``TypeError`` and
+  negative values raise ``ValueError``. The check runs after every
+  pre-existing validation (the reservations check included) and before
+  the search starts; in ``plan_batch`` it runs before any request is
+  searched, so an invalid batch never returns partial results.
+- The value caps the number of transitions from the start to the
+  endpoint: a move and a wait each consume one step (consecutive waits
+  included), so a route contains at most ``max_steps + 1`` coordinates
+  and a candidate that has already used its whole window is closed but
+  generates no successors -- no over-limit state is ever generated or
+  closed. The time frame index equals the step count, so the existing
+  static/dynamic obstacles, ``dynamic_costs`` and ``reservations``
+  semantics are unchanged; a ``start == goal`` single-point route still
+  succeeds under a zero window (the zero-expansion budget rule is
+  unchanged). A static search with a window runs as the same
+  history-sensitive route traversal as dynamic mode (distinct coordinate
+  histories are never merged, since a cheaper arrival to a cell may use
+  more steps than a costlier one), recording coordinate pairs in its
+  trace; generous windows keep the unlimited route, cost and tie-breaks.
+- When the window is provided every result carries ``status``: success
+  is ``"found"`` with the usual ``path``/``cost``/``expanded``; on
+  failure the result is ``"step_exhausted"`` when at least one candidate
+  was cut off by the window, otherwise the usual ``"unreachable"`` or
+  ``"cost_exhausted"``. When ``max_expanded`` is also given a budget
+  stop takes priority (``"budget_exhausted"``), then the window, then
+  the cost limit. ``expanded``/``expanded_nodes`` count only actually
+  closed candidates. ``plan_any`` keeps its endpoint and complete-path
+  tie-breaks, ``plan_k`` keeps its unique-route ordering and status
+  rules, ``plan_batch`` keeps request order and ``plan_multi_start``
+  keeps its winner rule.
+- With ``snapshot=True`` the checkpoint records ``max_steps`` when one
+  was provided (and no field when it was not), together with the
+  step-discard flag; ``resume`` treats a checkpoint without the field as
+  ``None``, validates a present field with the same rules
+  (``TypeError`` for wrong types, ``ValueError`` for a negative value or
+  a state inconsistent with the window -- for example a pending
+  candidate already beyond it) before any searching, and a resumed
+  search matches one uninterrupted call field by field, trace and the
+  next checkpoint included.
+- ``replay`` accepts the same ``max_steps``: without it nothing changes;
+  an otherwise valid path with more than ``max_steps`` transitions
+  returns the fixed invalid structure in non-diagnostic mode and, with
+  ``diagnose=True``, the unique code ``step_limit`` with
+  ``error_index`` equal to the first over-window index
+  (``max_steps + 1``). Every existing diagnostic code keeps its
+  precedence over ``step_limit``. All new results are JSON-serializable.
 
 Waiting in place (``allow_wait``):
 - ``plan``, ``plan_any``, ``plan_batch``, ``plan_multi_start``, ``plan_k``
@@ -373,24 +427,29 @@ Top-k planning (``plan_k``):
   in ``plan``: the start still costs 0, a candidate exactly at the
   limit still competes and a candidate whose accumulated cost would
   exceed it is discarded the moment it is generated. It never changes
-  the tie-break between legal routes. ``max_expanded`` caps the number
+  the tie-break between legal routes. ``max_steps`` caps the transition
+  count exactly as in ``plan`` (waits included): a candidate at the
+  window is closed but never extended, so only routes of at most
+  ``max_steps`` moves can appear. ``max_expanded`` caps the number
   of complete route candidates actually closed (exactly what
   ``expanded`` counts); once the limit is reached no further candidate
   is closed, and the limit only ever truncates the traversal -- it can
-  never replace an already determined higher-ranked route. When either
+  never replace an already determined higher-ranked route. When any
   limit is provided the result additionally carries ``status``:
   ``"found"`` when all ``k`` routes were closed or the search exhausted
   naturally with at least one route; ``"budget_exhausted"`` when fewer
   than ``k`` routes were found and the budget stopped the search while
-  candidates were still pending (this wins when both limits fire);
-  ``"cost_exhausted"`` when fewer than ``k`` routes were found, no
-  budget stop occurred and at least one candidate was discarded for the
-  cost limit; ``"unreachable"`` when no route exists with neither a
-  budget stop nor a cost discard. The routes already closed (and their
-  costs, in rank order) are still returned when a limit ends the search
-  early, as empty lists when none were found, and ``expanded`` is the
-  actual closed count. Omitting both limits keeps every legacy key and
-  value exactly unchanged.
+  candidates were still pending (this wins when all limits fire);
+  ``"step_exhausted"`` when fewer than ``k`` routes were found, no
+  budget stop occurred and at least one candidate was cut off by the
+  window; ``"cost_exhausted"`` when fewer than ``k`` routes were found,
+  neither other stop occurred and at least one candidate was discarded
+  for the cost limit; ``"unreachable"`` when no route exists with
+  neither a budget stop nor any discard. The routes already closed (and
+  their costs, in rank order) are still returned when a limit ends the
+  search early, as empty lists when none were found, and ``expanded``
+  is the actual closed count. Omitting all limits keeps every legacy
+  key and value exactly unchanged.
 
 Batch planning (``plan_batch``):
 - ``plan_batch(width, height, blocked, requests, costs=None,
@@ -567,7 +626,10 @@ Offline replay (``replay``):
   occurrence), ``non_adjacent`` (the later element of the pair),
   ``static_blocked`` and ``dynamic_blocked`` (the offending element);
   ties resolve to the earliest rule in this list and no partial cost is
-  ever returned.
+  ever returned. When ``max_steps`` is given, an otherwise valid path
+  that needs more than ``max_steps`` transitions finally reports
+  ``step_limit`` at index ``max_steps + 1``; it has the lowest precedence
+  of every code and never replaces an earlier structural violation.
 
 Distance field (``distance_field``):
 - ``distance_field(width, height, blocked, goal, costs=None,
@@ -1298,11 +1360,52 @@ def _validate_max_cost(max_cost):
             )
 
 
-def _status_for(budget_stop, cost_limited):
-    # The failure status when a limit is in play: a budget stop always
-    # wins, then a cost-limit discard, otherwise plain unreachability.
+def _validate_max_steps(max_steps):
+    # The shared non-negative-integer step-window rules used by every
+    # planner (and by ``resume`` for a checkpoint field): ``None`` disables
+    # the window; other types raise ``TypeError`` (booleans included, they
+    # are not accepted) and negative values raise ``ValueError``.
+    if max_steps is not None:
+        if not _is_int(max_steps):
+            raise TypeError(
+                f"max_steps must be an int, "
+                f"got {type(max_steps).__name__}"
+            )
+        if max_steps < 0:
+            raise ValueError(
+                f"max_steps must be a non-negative integer, "
+                f"got {max_steps}"
+            )
+
+
+def _restore_step_limited(raw, max_steps):
+    # The optional step-discard flag inside a snapshot state: absent (the
+    # only possibility in checkpoints written before the step window
+    # existed, and the shape produced whenever no window is in play) means
+    # no discard happened yet. A present flag must be a bool, and a
+    # recorded discard is inconsistent with a checkpoint that carries no
+    # step window.
+    step_limited = raw.get("step_limited", False)
+    if not isinstance(step_limited, bool):
+        raise TypeError(
+            f"checkpoint state step_limited must be a bool, "
+            f"got {type(step_limited).__name__}"
+        )
+    if step_limited and max_steps is None:
+        raise ValueError(
+            "checkpoint state records a step discard without a step limit"
+        )
+    return step_limited
+
+
+def _status_for(budget_stop, cost_limited, step_limited=False):
+    # The failure status when limits are in play: a budget stop always
+    # wins, then a step-window discard, then a cost-limit discard,
+    # otherwise plain unreachability.
     if budget_stop:
         return "budget_exhausted"
+    if step_limited:
+        return "step_exhausted"
     if cost_limited:
         return "cost_exhausted"
     return "unreachable"
@@ -1431,7 +1534,8 @@ def _search_static(width, height, obstacles, start, goal, costs, trace,
 def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
                     trace, max_expanded, max_cost=None, snapshot=False,
                     allow_wait=False, state=None, cost_frames=None,
-                    reservations=None, goal_not_before=None):
+                    reservations=None, goal_not_before=None,
+                    max_steps=None):
     """History-sensitive time-expanded A*.
 
     Frame ``t`` constrains the cell occupied at path index ``t``; frames
@@ -1550,6 +1654,7 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
         closed_count = 0
         expanded_nodes = [] if trace or snapshot else None
         cost_limited = False
+        step_limited = False
         # Best goal closing seen so far, keyed exactly as the tie-break
         # specializes at the goal: (g, t, path) (there f == g, h == 0 and
         # (x, y) is fixed). Closing a goal does not stop the search
@@ -1566,8 +1671,10 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
         expanded_nodes = state["expanded_nodes"]
         best_key = state["best_key"]
         cost_limited = state["cost_limited"]
+        step_limited = state["step_limited"]
     budget_stop = False
-    has_status = max_expanded is not None or max_cost is not None
+    has_status = (max_expanded is not None or max_cost is not None
+                  or max_steps is not None)
 
     while open_heap:
         if best_key is not None and open_heap[0][0] > best_key[0]:
@@ -1588,6 +1695,13 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
             if best_key is None or goal_key < best_key:
                 best_key = goal_key
             continue  # routes end at the goal; never expanded past it
+        if max_steps is not None and t >= max_steps:
+            # The route already used its whole action window: it is a
+            # closed candidate (so it counted toward ``expanded``) but no
+            # longer generates successors, and the search remembers that
+            # a candidate was cut off by the window.
+            step_limited = True
+            continue
         next_t = t + 1
         frame = frame_cells(next_t)
         reserved = reserved_vertices(next_t)
@@ -1638,7 +1752,8 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
     if best_key is None:
         result = {"path": None, "cost": None, "expanded": closed_count}
         if has_status:
-            result["status"] = _status_for(budget_stop, cost_limited)
+            result["status"] = _status_for(budget_stop, cost_limited,
+                                           step_limited)
     else:
         best_g, _, best_path = best_key
         result = {
@@ -1655,8 +1770,9 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
             "plan", width, height, obstacles, start, goal, costs, frames,
             max_cost, closed_count, expanded_nodes,
             _tree_snapshot_state(open_heap, best_key, "plan",
-                                 cost_limited, max_cost),
-            allow_wait, cost_frames, reservations,
+                                 cost_limited, max_cost, step_limited,
+                                 max_steps),
+            allow_wait, cost_frames, reservations, max_steps,
         )
     return result
 
@@ -1664,7 +1780,8 @@ def _search_dynamic(width, height, obstacles, frames, start, goal, costs,
 def _search_any(width, height, obstacles, frames, start, goals, costs,
                 trace, max_expanded, max_cost=None, snapshot=False,
                 allow_wait=False, state=None, cost_frames=None,
-                reservations=None):
+                reservations=None, planner_kind="plan_any",
+                max_steps=None):
     """History-sensitive time-expanded A* over several candidate goals.
 
     This is the ``plan_any`` counterpart of ``_search_dynamic``. The only
@@ -1772,6 +1889,7 @@ def _search_any(width, height, obstacles, frames, start, goals, costs,
         closed_count = 0
         expanded_nodes = [] if trace or snapshot else None
         cost_limited = False
+        step_limited = False
         # Best goal closing seen so far, keyed as (g, (x, y), path):
         # minimum total cost first, then the endpoint coordinate's
         # lexicographic order, then the complete route's lexicographic
@@ -1789,8 +1907,10 @@ def _search_any(width, height, obstacles, frames, start, goals, costs,
         expanded_nodes = state["expanded_nodes"]
         best_key = state["best_key"]
         cost_limited = state["cost_limited"]
+        step_limited = state["step_limited"]
     budget_stop = False
-    has_status = max_expanded is not None or max_cost is not None
+    has_status = (max_expanded is not None or max_cost is not None
+                  or max_steps is not None)
 
     while open_heap:
         if best_key is not None and open_heap[0][0] > best_key[0]:
@@ -1809,10 +1929,26 @@ def _search_any(width, height, obstacles, frames, start, goals, costs,
             expanded_nodes.append((x, y, t) if dynamic else (x, y))
         cell = (x, y)
         if cell in goals:
-            goal_key = (g, cell, path)
+            # The tie field matches the checkpoint kind exactly: the
+            # arrival time for ``plan`` (always 0 in static capped mode)
+            # and the endpoint coordinate for ``plan_any``. Either is a
+            # constant within its kind, so the ``(g, tie, path)`` ordering
+            # is identical to ``(g, path)`` among goal closings.
+            tie = t if planner_kind == "plan" else cell
+            goal_key = (g, tie, path)
             if best_key is None or goal_key < best_key:
                 best_key = goal_key
             continue  # routes end at a goal; never expanded past one
+        if max_steps is not None:
+            used = t if dynamic else len(path) - 1
+            if used >= max_steps:
+                # The route already used its whole action window: static
+                # mode reads the depth from the path (the time stays 0
+                # there), dynamic mode from the frame. The candidate stays
+                # closed (it counted toward ``expanded``) but generates no
+                # successors.
+                step_limited = True
+                continue
         next_t = t + 1 if dynamic else 0
         frame = frame_cells(next_t) if dynamic else frozenset()
         reserved = reserved_vertices(next_t)
@@ -1855,7 +1991,8 @@ def _search_any(width, height, obstacles, frames, start, goals, costs,
     if best_key is None:
         result = {"path": None, "cost": None, "expanded": closed_count}
         if has_status:
-            result["status"] = _status_for(budget_stop, cost_limited)
+            result["status"] = _status_for(budget_stop, cost_limited,
+                                           step_limited)
     else:
         best_g, _, best_path = best_key
         result = {
@@ -1868,12 +2005,14 @@ def _search_any(width, height, obstacles, frames, start, goals, costs,
     if trace:
         result["expanded_nodes"] = expanded_nodes
     if snapshot and result.get("status") == "budget_exhausted":
+        endpoints = goals[0] if planner_kind == "plan" else goals
         result["checkpoint"] = _snapshot_checkpoint(
-            "plan_any", width, height, obstacles, start, goals, costs,
+            planner_kind, width, height, obstacles, start, endpoints, costs,
             frames, max_cost, closed_count, expanded_nodes,
-            _tree_snapshot_state(open_heap, best_key, "plan_any",
-                                 cost_limited, max_cost),
-            allow_wait, cost_frames, reservations,
+            _tree_snapshot_state(open_heap, best_key, planner_kind,
+                                 cost_limited, max_cost, step_limited,
+                                 max_steps),
+            allow_wait, cost_frames, reservations, max_steps,
         )
     return result
 
@@ -2022,7 +2161,8 @@ def _search_multi_static(width, height, obstacles, starts, goal, costs,
 def _search_multi_dynamic(width, height, obstacles, frames, starts, goal,
                           costs, trace, max_expanded, max_cost=None,
                           snapshot=False, allow_wait=False, state=None,
-                          cost_frames=None, reservations=None):
+                          cost_frames=None, reservations=None,
+                          max_steps=None):
     """History-sensitive time-expanded multi-source A*.
 
     This is the ``plan_multi_start`` counterpart of ``_search_dynamic``:
@@ -2060,6 +2200,14 @@ def _search_multi_dynamic(width, height, obstacles, frames, starts, goal,
     def heuristic(point):
         return abs(point[0] - goal[0]) + abs(point[1] - goal[1])
 
+    # When ``frames``, ``cost_frames`` and ``reservations`` are all absent
+    # the traversal still runs as a route tree: a static ``plan_multi_start``
+    # call with a step window caps routes by their path depth here rather
+    # than through the coordinate-merging static search, which is exactly
+    # what enforces the window without merging distinct histories. In that
+    # mode the time stays fixed at 0 and traces record coordinate pairs.
+    dynamic = (frames is not None or cost_frames is not None
+               or reservations is not None)
     last_frame = len(frames) - 1 if frames is not None else None
     last_cost_frame = (len(cost_frames) - 1
                        if cost_frames is not None else None)
@@ -2130,6 +2278,7 @@ def _search_multi_dynamic(width, height, obstacles, frames, starts, goal,
         closed_count = 0
         expanded_nodes = [] if trace or snapshot else None
         cost_limited = False
+        step_limited = False
         # Best goal closing seen so far, keyed as (g, path): minimum total
         # cost first, then the complete route's lexicographic order.
         # Closing a goal does not stop the search immediately: an equally
@@ -2146,8 +2295,10 @@ def _search_multi_dynamic(width, height, obstacles, frames, starts, goal,
         expanded_nodes = state["expanded_nodes"]
         best_key = state["best_key"]
         cost_limited = state["cost_limited"]
+        step_limited = state["step_limited"]
     budget_stop = False
-    has_status = max_expanded is not None or max_cost is not None
+    has_status = (max_expanded is not None or max_cost is not None
+                  or max_steps is not None)
 
     while open_heap:
         if best_key is not None and open_heap[0][0] > best_key[0]:
@@ -2160,16 +2311,24 @@ def _search_multi_dynamic(width, height, obstacles, frames, starts, goal,
         _, _, x, y, t, g, path, seen = heapq.heappop(open_heap)
         closed_count += 1  # every popped route node closes exactly once
         if expanded_nodes is not None:
-            # Histories reaching the same (x, y, t) each record a triple,
-            # in the order their route nodes are actually closed.
-            expanded_nodes.append((x, y, t))
+            # Static capped mode records coordinate pairs, dynamic mode
+            # the (x, y, t) triple; distinct histories each record an
+            # entry in actual closing order.
+            expanded_nodes.append((x, y, t) if dynamic else (x, y))
         if (x, y) == goal:
             goal_key = (g, path)
             if best_key is None or goal_key < best_key:
                 best_key = goal_key
             continue  # routes end at the goal; never expanded past it
-        next_t = t + 1
-        frame = frame_cells(next_t)
+        if max_steps is not None:
+            used = t if dynamic else len(path) - 1
+            if used >= max_steps:
+                # The route already used its whole action window; the
+                # candidate stays closed but generates no successors.
+                step_limited = True
+                continue
+        next_t = t + 1 if dynamic else 0
+        frame = frame_cells(next_t) if dynamic else frozenset()
         reserved = reserved_vertices(next_t)
         for dx, dy in _NEIGHBORS:
             nx, ny = x + dx, y + dy
@@ -2210,7 +2369,8 @@ def _search_multi_dynamic(width, height, obstacles, frames, starts, goal,
     if best_key is None:
         result = {"path": None, "cost": None, "expanded": closed_count}
         if has_status:
-            result["status"] = _status_for(budget_stop, cost_limited)
+            result["status"] = _status_for(budget_stop, cost_limited,
+                                           step_limited)
     else:
         best_g, best_path = best_key
         result = {
@@ -2224,18 +2384,19 @@ def _search_multi_dynamic(width, height, obstacles, frames, starts, goal,
         result["expanded_nodes"] = expanded_nodes
     if snapshot and result.get("status") == "budget_exhausted":
         result["checkpoint"] = _snapshot_checkpoint_multi(
-            width, height, obstacles, starts, goal, costs, frames,
+            width, height, obstacles, starts, goal, costs,
+            frames if dynamic else None,
             max_cost, closed_count, expanded_nodes,
             _multi_tree_snapshot_state(open_heap, best_key, cost_limited,
-                                       max_cost),
-            allow_wait, cost_frames, reservations,
+                                       max_cost, step_limited, max_steps),
+            allow_wait, cost_frames, reservations, max_steps,
         )
     return result
 
 
 def _search_k(width, height, obstacles, frames, start, goal, costs, k,
               max_expanded=None, max_cost=None, allow_wait=False,
-              cost_frames=None, reservations=None):
+              cost_frames=None, reservations=None, max_steps=None):
     """Best-first traversal of the feasible route tree keeping the k best.
 
     This is the ``plan_k`` search. As in ``_search_dynamic`` and
@@ -2356,8 +2517,10 @@ def _search_k(width, height, obstacles, frames, start, goal, costs, k,
     found_paths = []
     found_costs = []
     cost_limited = False  # any candidate discarded for exceeding max_cost
+    step_limited = False  # any candidate cut off by the action window
     budget_stop = False
-    has_status = max_expanded is not None or max_cost is not None
+    has_status = (max_expanded is not None or max_cost is not None
+                  or max_steps is not None)
 
     while open_heap and len(found_paths) < k:
         if max_expanded is not None and expanded >= max_expanded:
@@ -2376,6 +2539,13 @@ def _search_k(width, height, obstacles, frames, start, goal, costs, k,
             found_paths.append(list(path))
             found_costs.append(g)
             continue
+        if max_steps is not None:
+            used = t if dynamic else len(path) - 1
+            if used >= max_steps:
+                # The candidate already used its whole action window; it
+                # stays closed but generates no successors.
+                step_limited = True
+                continue
         next_t = t + 1 if dynamic else 0
         frame = frame_cells(next_t) if dynamic else frozenset()
         reserved = reserved_vertices(next_t)
@@ -2423,16 +2593,21 @@ def _search_k(width, height, obstacles, frames, start, goal, costs, k,
             result["status"] = "found"
         elif budget_stop:
             # The budget cut the search short with candidates still
-            # pending; this takes priority over the cost-limit status.
+            # pending; this takes priority over every limit status.
             result["status"] = "budget_exhausted"
         elif found_paths:
             # The heap drained naturally (no budget truncation) and at
             # least one ranked route was closed, just fewer than k.
             result["status"] = "found"
+        elif step_limited:
+            # No route was found, but at least one candidate used its
+            # whole action window while no budget cut the traversal
+            # short; this wins over the cost-limit status.
+            result["status"] = "step_exhausted"
         elif cost_limited:
             # No route was found, but at least one candidate had to be
-            # dropped for exceeding the cost limit while no budget cut
-            # the traversal short.
+            # dropped for exceeding the cost limit while neither the
+            # budget nor the step window ended the traversal.
             result["status"] = "cost_exhausted"
         else:
             result["status"] = "unreachable"
@@ -2585,12 +2760,14 @@ def _search_distance_field_any(width, height, obstacles, goals, costs,
 def _snapshot_checkpoint(planner, width, height, obstacles, start, endpoints,
                          costs, frames, max_cost, closed_count,
                          expanded_nodes, state, allow_wait=False,
-                         cost_frames=None, reservations=None):
+                         cost_frames=None, reservations=None,
+                         max_steps=None):
     # The checkpoint is built from JSON-native values only (ints, strings,
     # lists, dicts, ``None``) in one fixed key order, and every list
     # derived from a set is sorted, so neither set iteration order, goal
     # order nor in-frame coordinate order can influence the result. The
     # ``max_cost`` field is only present when a cost limit was provided,
+    # ``max_steps`` only when an action window was provided,
     # ``dynamic_costs`` is only present when time-varying costs were
     # provided, ``reservations`` is only present when reserved routes
     # were provided, and ``allow_wait`` is only recorded when waiting was
@@ -2629,6 +2806,8 @@ def _snapshot_checkpoint(planner, width, height, obstacles, start, endpoints,
         ]
     if max_cost is not None:
         checkpoint["max_cost"] = max_cost
+    if max_steps is not None:
+        checkpoint["max_steps"] = max_steps
     if allow_wait:
         checkpoint["allow_wait"] = True
     checkpoint["closed"] = closed_count
@@ -2662,12 +2841,14 @@ def _static_snapshot_state(open_heap, came_from, g_score, closed,
 
 
 def _tree_snapshot_state(open_heap, best_key, planner, cost_limited,
-                         max_cost):
+                         max_cost, step_limited=False, max_steps=None):
     # The complete route-tree state: every live candidate with its full
     # coordinate history (the ``seen`` frozenset is derived from the path
     # on restore) plus the best goal closing recorded so far, keyed as
     # (g, t, path) for ``plan`` and (g, (x, y), path) for ``plan_any``.
-    # The cost-discard flag is only recorded when a cost limit is in play.
+    # The cost-discard flag is only recorded when a cost limit is in
+    # play and the step-discard flag only when an action window is in
+    # play.
     if best_key is None:
         best = None
     else:
@@ -2686,20 +2867,23 @@ def _tree_snapshot_state(open_heap, best_key, planner, cost_limited,
     }
     if max_cost is not None:
         state["cost_limited"] = cost_limited
+    if max_steps is not None:
+        state["step_limited"] = step_limited
     return state
 
 
 def _snapshot_checkpoint_multi(width, height, obstacles, starts, goal, costs,
                                frames, max_cost, closed_count, expanded_nodes,
                                state, allow_wait=False, cost_frames=None,
-                               reservations=None):
+                               reservations=None, max_steps=None):
     # The ``plan_multi_start`` checkpoint: like ``_snapshot_checkpoint``
     # but with the sorted start tuple in place of the single start. Only
     # JSON-native values are used and every set-derived list is sorted, so
     # neither obstacle-set iteration order, start order nor in-frame
-    # coordinate order can influence the result. The ``max_cost`` field is
-    # only present when a cost limit was provided, ``dynamic_costs`` is
-    # only present when time-varying costs were provided,
+    # coordinate order can influence the result. The ``max_cost`` field
+    # is only present when a cost limit was provided, ``max_steps`` only
+    # when an action window was provided, ``dynamic_costs`` is only
+    # present when time-varying costs were provided,
     # ``reservations`` is only present when reserved routes were
     # provided, and ``allow_wait`` is only recorded when waiting was
     # enabled.
@@ -2731,6 +2915,8 @@ def _snapshot_checkpoint_multi(width, height, obstacles, starts, goal, costs,
         ]
     if max_cost is not None:
         checkpoint["max_cost"] = max_cost
+    if max_steps is not None:
+        checkpoint["max_steps"] = max_steps
     if allow_wait:
         checkpoint["allow_wait"] = True
     checkpoint["closed"] = closed_count
@@ -2761,12 +2947,14 @@ def _multi_static_snapshot_state(open_heap, best, closed, cost_limited,
     return state
 
 
-def _multi_tree_snapshot_state(open_heap, best_key, cost_limited, max_cost):
+def _multi_tree_snapshot_state(open_heap, best_key, cost_limited, max_cost,
+                               step_limited=False, max_steps=None):
     # The complete multi-start route-tree state: every live candidate with
     # its full coordinate history (the ``seen`` frozenset is derived from
     # the path on restore) plus the best goal closing recorded so far,
     # keyed as (g, path). The cost-discard flag is only recorded when a
-    # cost limit is in play.
+    # cost limit is in play and the step-discard flag only when an
+    # action window is in play.
     if best_key is None:
         best = None
     else:
@@ -2781,6 +2969,8 @@ def _multi_tree_snapshot_state(open_heap, best_key, cost_limited, max_cost):
     }
     if max_cost is not None:
         state["cost_limited"] = cost_limited
+    if max_steps is not None:
+        state["step_limited"] = step_limited
     return state
 
 
@@ -3081,7 +3271,7 @@ def _restore_static_state(raw, width, height, obstacles, start, goal,
 def _restore_tree_state(raw, planner, dynamic, width, height, obstacles,
                         frames, start, goal, goals, costs, closed_count,
                         trace, max_cost, allow_wait=False, cost_frames=None,
-                        reservations=None):
+                        reservations=None, max_steps=None):
     # Rebuild and fully cross-check a route-tree snapshot state (dynamic
     # ``plan``, and ``plan_any`` in both static and dynamic mode). Here
     # ``dynamic`` means the search is time-expanded, which timed obstacle
@@ -3098,6 +3288,7 @@ def _restore_tree_state(raw, planner, dynamic, width, height, obstacles,
                 f"checkpoint state is missing required field {key!r}"
             )
     cost_limited = _restore_cost_limited(raw, max_cost)
+    step_limited = _restore_step_limited(raw, max_steps)
 
     def heuristic(point):
         if planner == "plan":
@@ -3189,6 +3380,10 @@ def _restore_tree_state(raw, planner, dynamic, width, height, obstacles,
         if t != expected_t:
             raise ValueError(
                 "checkpoint candidate time does not match its path"
+            )
+        if max_steps is not None and len(path) - 1 > max_steps:
+            raise ValueError(
+                "checkpoint candidate exceeds the action window"
             )
         seen = set()
         total = 0
@@ -3291,7 +3486,8 @@ def _restore_tree_state(raw, planner, dynamic, width, height, obstacles,
                 raise ValueError(
                     "checkpoint best route does not end at the goal"
                 )
-            if best_tie != len(best_path) - 1:
+            expected_tie = len(best_path) - 1 if dynamic else 0
+            if best_tie != expected_tie:
                 raise ValueError(
                     "checkpoint best key does not match its arrival time"
                 )
@@ -3308,6 +3504,7 @@ def _restore_tree_state(raw, planner, dynamic, width, height, obstacles,
         "closed_count": closed_count,
         "expanded_nodes": list(trace),
         "cost_limited": cost_limited,
+        "step_limited": step_limited,
     }
 
 
@@ -3504,12 +3701,15 @@ def _restore_multi_static_state(raw, width, height, obstacles, starts, goal,
 def _restore_multi_tree_state(raw, width, height, obstacles, frames, starts,
                               goal, costs, closed_count, trace, max_cost,
                               allow_wait=False, cost_frames=None,
-                              reservations=None):
+                              reservations=None, max_steps=None):
     # Rebuild and fully cross-check the multi-start route-tree snapshot
-    # state (dynamic ``plan_multi_start``). Timed obstacle frames,
+    # state (dynamic ``plan_multi_start``, and the static history
+    # traversal a step window forces). Timed obstacle frames,
     # time-varying cost frames or reserved routes all make the search
-    # time-expanded; only the obstacle frames and the reservations
-    # constrain cells, edges and waits.
+    # time-expanded; with none of them the time stays 0 and only the
+    # obstacle frame and reservation constraints apply.
+    dynamic = (frames is not None or cost_frames is not None
+               or reservations is not None)
     if not isinstance(raw, dict):
         raise TypeError(
             f"checkpoint state must be an object, got {type(raw).__name__}"
@@ -3520,6 +3720,7 @@ def _restore_multi_tree_state(raw, width, height, obstacles, frames, starts,
                 f"checkpoint state is missing required field {key!r}"
             )
     cost_limited = _restore_cost_limited(raw, max_cost)
+    step_limited = _restore_step_limited(raw, max_steps)
 
     def heuristic(point):
         return abs(point[0] - goal[0]) + abs(point[1] - goal[1])
@@ -3596,9 +3797,14 @@ def _restore_multi_tree_state(raw, width, height, obstacles, frames, starts,
             raise ValueError(
                 "checkpoint candidate path does not begin at a start"
             )
-        if t != len(path) - 1:
+        expected_t = len(path) - 1 if dynamic else 0
+        if t != expected_t:
             raise ValueError(
                 "checkpoint candidate time does not match its path"
+            )
+        if max_steps is not None and len(path) - 1 > max_steps:
+            raise ValueError(
+                "checkpoint candidate exceeds the action window"
             )
         seen = set()
         total = 0
@@ -3685,7 +3891,7 @@ def _restore_multi_tree_state(raw, width, height, obstacles, frames, starts,
             )
     if best is not None:
         best_g, best_path = best
-        check_route(best_path, len(best_path) - 1, best_g)
+        check_route(best_path, len(best_path) - 1 if dynamic else 0, best_g)
         if best_path[-1] != goal:
             raise ValueError(
                 "checkpoint best route does not end at the goal"
@@ -3703,6 +3909,7 @@ def _restore_multi_tree_state(raw, width, height, obstacles, frames, starts,
         "closed_count": closed_count,
         "expanded_nodes": list(trace),
         "cost_limited": cost_limited,
+        "step_limited": step_limited,
     }
 
 
@@ -3805,6 +4012,22 @@ def _restore_checkpoint(checkpoint):
                 f"checkpoint max_cost must be a non-negative integer, "
                 f"got {max_cost}"
             )
+    # The action window is optional: checkpoints written before it
+    # existed (and checkpoints of searches without one) simply omit the
+    # field, which restores as ``None``. A present field follows the same
+    # rules as ``plan``'s ``max_steps``.
+    max_steps = checkpoint.get("max_steps")
+    if max_steps is not None:
+        if not _is_int(max_steps):
+            raise TypeError(
+                f"checkpoint max_steps must be an int, "
+                f"got {type(max_steps).__name__}"
+            )
+        if max_steps < 0:
+            raise ValueError(
+                f"checkpoint max_steps must be a non-negative integer, "
+                f"got {max_steps}"
+            )
     # The waiting flag is optional: checkpoints written before it existed
     # (and checkpoints of searches without waiting) simply omit the field,
     # which restores as ``False``. A present field must be a bool, and the
@@ -3861,10 +4084,14 @@ def _restore_checkpoint(checkpoint):
         )
     dynamic = (frames is not None or cost_frames is not None
                or reservations is not None)
-    # Only the static merged searches close each cell at most once;
-    # route-tree searches may record the same cell through different
-    # histories.
-    unique_trace = planner in ("plan", "plan_multi_start") and not dynamic
+    # A static search with a step window runs as a history traversal, so
+    # its state is a route-tree state even without timed frames. Only the
+    # plain coordinate-merging searches close each cell at most once and
+    # record unique pairs; route-tree searches may record the same cell
+    # through different histories.
+    history_traversal = dynamic or max_steps is not None
+    unique_trace = (planner in ("plan", "plan_multi_start")
+                    and not history_traversal)
     trace = _restore_trace(
         checkpoint["trace"], dynamic, unique_trace, width, height,
         obstacles, frames, reservations
@@ -3883,17 +4110,17 @@ def _restore_checkpoint(checkpoint):
             raise ValueError("checkpoint trace does not begin at start")
         if dynamic and trace[0][2] != 0:
             raise ValueError("checkpoint trace does not begin at frame 0")
-    if planner == "plan" and not dynamic:
+    if planner == "plan" and not history_traversal:
         state = _restore_static_state(
             checkpoint["state"], width, height, obstacles, start, goal,
             trace, max_cost
         )
     elif planner == "plan_multi_start":
-        if dynamic:
+        if history_traversal:
             state = _restore_multi_tree_state(
                 checkpoint["state"], width, height, obstacles, frames,
                 starts, goal, costs, closed_count, trace, max_cost,
-                allow_wait, cost_frames, reservations
+                allow_wait, cost_frames, reservations, max_steps
             )
         else:
             state = _restore_multi_static_state(
@@ -3904,7 +4131,8 @@ def _restore_checkpoint(checkpoint):
         state = _restore_tree_state(
             checkpoint["state"], planner, dynamic, width, height,
             obstacles, frames, start, goal, goals, costs, closed_count,
-            trace, max_cost, allow_wait, cost_frames, reservations
+            trace, max_cost, allow_wait, cost_frames, reservations,
+            max_steps
         )
     return {
         "planner": planner,
@@ -3920,6 +4148,7 @@ def _restore_checkpoint(checkpoint):
         "cost_frames": cost_frames,
         "reservations": reservations,
         "max_cost": max_cost,
+        "max_steps": max_steps,
         "allow_wait": allow_wait,
         "state": state,
     }
@@ -3928,7 +4157,7 @@ def _restore_checkpoint(checkpoint):
 def plan(width, height, blocked, start, goal, costs=None, trace=False,
          dynamic_blocked=None, max_expanded=None, snapshot=False,
          max_cost=None, allow_wait=False, dynamic_costs=None,
-         reservations=None):
+         reservations=None, max_steps=None):
     # --- Validation: everything is checked before the search begins. ---
     width = _validate_dimension(width, "width")
     height = _validate_dimension(height, "height")
@@ -3972,12 +4201,29 @@ def plan(width, height, blocked, start, goal, costs=None, trace=False,
     reservation_paths = _normalize_reservations(
         reservations, width, height, obstacles
     )
+    # The action window is the last check before the search starts, so
+    # every pre-existing validation keeps its order.
+    _validate_max_steps(max_steps)
     if (frames is not None or cost_frames is not None
             or reservation_paths is not None):
         return _search_dynamic(
             width, height, obstacles, frames, start, goal, costs, trace,
             max_expanded, max_cost, snapshot, allow_wait,
-            cost_frames=cost_frames, reservations=reservation_paths
+            cost_frames=cost_frames, reservations=reservation_paths,
+            max_steps=max_steps
+        )
+    if max_steps is not None:
+        # A step window turns even the static grid into a history
+        # traversal: routes are distinct coordinate sequences and the
+        # window caps their depth, so the route-tree search enforces it
+        # exactly while merging nothing. A single goal is passed as the
+        # only candidate endpoint with ``planner_kind="plan"``, which
+        # keeps the single-goal key ordering and checkpoint shape.
+        return _search_any(
+            width, height, obstacles, None, start, (goal,), costs, trace,
+            max_expanded, max_cost, snapshot, allow_wait,
+            cost_frames=None, reservations=None, planner_kind="plan",
+            max_steps=max_steps
         )
     return _search_static(
         width, height, obstacles, start, goal, costs, trace, max_expanded,
@@ -3988,7 +4234,7 @@ def plan(width, height, blocked, start, goal, costs=None, trace=False,
 def plan_any(width, height, blocked, start, goals, costs=None, trace=False,
              dynamic_blocked=None, max_expanded=None, snapshot=False,
              max_cost=None, allow_wait=False, dynamic_costs=None,
-             reservations=None):
+             reservations=None, max_steps=None):
     # --- Validation: ``goals`` takes ``goal``'s exact position in       ---
     # --- ``plan``'s validation sequence; every shared check keeps its   ---
     # --- order, exception type and message boundary.                    ---
@@ -4034,17 +4280,20 @@ def plan_any(width, height, blocked, start, goals, costs=None, trace=False,
     reservation_paths = _normalize_reservations(
         reservations, width, height, obstacles
     )
+    # The action window is the last check before the search starts.
+    _validate_max_steps(max_steps)
     return _search_any(
         width, height, obstacles, frames, start, goal_points, costs, trace,
         max_expanded, max_cost, snapshot, allow_wait,
-        cost_frames=cost_frames, reservations=reservation_paths
+        cost_frames=cost_frames, reservations=reservation_paths,
+        planner_kind="plan_any", max_steps=max_steps
     )
 
 
 def plan_batch(width, height, blocked, requests, costs=None, trace=False,
                dynamic_blocked=None, max_expanded=None, snapshot=False,
                max_cost=None, allow_wait=False, dynamic_costs=None,
-               reservations=None):
+               reservations=None, max_steps=None):
     # --- Validation: ``plan``'s shared checks in their usual order,    ---
     # --- with ``requests`` occupying the position of ``start``/``goal``---
     # --- in that sequence. Every check is decided before any search    ---
@@ -4098,11 +4347,14 @@ def plan_batch(width, height, blocked, requests, costs=None, trace=False,
     reservation_paths = _normalize_reservations(
         reservations, width, height, obstacles
     )
+    # The action window is the last check, still before any request is
+    # searched, so an invalid batch never returns partial results.
+    _validate_max_steps(max_steps)
     # Each request is an independent ``plan`` search over the shared,
     # already normalized grid: ``path``/``cost``/``expanded`` are
-    # produced per query and the budget and cost limit apply per query,
-    # so no search state is ever shared between requests. The input
-    # order and duplicate requests are preserved in the results.
+    # produced per query and the budget, cost and step limits apply per
+    # query, so no search state is ever shared between requests. The
+    # input order and duplicate requests are preserved in the results.
     results = []
     for start, goal in pairs:
         if (frames is not None or cost_frames is not None
@@ -4110,7 +4362,17 @@ def plan_batch(width, height, blocked, requests, costs=None, trace=False,
             results.append(_search_dynamic(
                 width, height, obstacles, frames, start, goal, costs,
                 trace, max_expanded, max_cost, snapshot, allow_wait,
-                cost_frames=cost_frames, reservations=reservation_paths
+                cost_frames=cost_frames, reservations=reservation_paths,
+                max_steps=max_steps
+            ))
+        elif max_steps is not None:
+            # A static query with a step window runs the same
+            # history-traversing search as ``plan`` does in that case.
+            results.append(_search_any(
+                width, height, obstacles, None, start, (goal,), costs,
+                trace, max_expanded, max_cost, snapshot, allow_wait,
+                cost_frames=None, reservations=None, planner_kind="plan",
+                max_steps=max_steps
             ))
         else:
             results.append(_search_static(
@@ -4228,7 +4490,7 @@ def plan_agents(width, height, blocked, requests, costs=None, trace=False,
 def plan_multi_start(width, height, blocked, starts, goal, costs=None,
                      trace=False, dynamic_blocked=None, max_expanded=None,
                      snapshot=False, max_cost=None, allow_wait=False,
-                     dynamic_costs=None, reservations=None):
+                     dynamic_costs=None, reservations=None, max_steps=None):
     # --- Validation: ``starts`` takes ``start``'s exact position in     ---
     # --- ``plan``'s validation sequence; every shared check keeps its   ---
     # --- order, exception type and message boundary.                    ---
@@ -4274,12 +4536,25 @@ def plan_multi_start(width, height, blocked, starts, goal, costs=None,
     reservation_paths = _normalize_reservations(
         reservations, width, height, obstacles
     )
+    # The action window is the last check before the search starts.
+    _validate_max_steps(max_steps)
     if (frames is not None or cost_frames is not None
             or reservation_paths is not None):
         return _search_multi_dynamic(
             width, height, obstacles, frames, start_points, goal, costs,
             trace, max_expanded, max_cost, snapshot, allow_wait,
-            cost_frames=cost_frames, reservations=reservation_paths
+            cost_frames=cost_frames, reservations=reservation_paths,
+            max_steps=max_steps
+        )
+    if max_steps is not None:
+        # A step window turns the static multi-source search into a
+        # history traversal with per-route depth, reusing the time-expanded
+        # traversal with no frames (the time stays 0 and traces record
+        # coordinate pairs), exactly as ``plan`` does.
+        return _search_multi_dynamic(
+            width, height, obstacles, None, start_points, goal, costs,
+            trace, max_expanded, max_cost, snapshot, allow_wait,
+            cost_frames=None, reservations=None, max_steps=max_steps
         )
     return _search_multi_static(
         width, height, obstacles, start_points, goal, costs, trace,
@@ -4289,7 +4564,8 @@ def plan_multi_start(width, height, blocked, starts, goal, costs=None,
 
 def plan_k(width, height, blocked, start, goal, k, costs=None,
            dynamic_blocked=None, max_expanded=None, max_cost=None,
-           allow_wait=False, dynamic_costs=None, reservations=None):
+           allow_wait=False, dynamic_costs=None, reservations=None,
+           max_steps=None):
     """Return up to ``k`` distinct routes ordered by priority.
 
     ``plan_k(width, height, blocked, start, goal, k, costs=None,
@@ -4329,20 +4605,24 @@ def plan_k(width, height, blocked, start, goal, k, costs=None,
     ``replay`` with the same cost and step count, in both static and
     dynamic mode.
 
-    When either ``max_expanded`` or ``max_cost`` is provided (not
-    omitted/``None``) the result additionally carries ``status``:
-    ``"found"`` when all ``k`` routes were closed or the search exhausted
-    naturally with at least one route; ``"budget_exhausted"`` when fewer
-    than ``k`` routes were found and the close budget stopped the search
-    while candidates remained pending; ``"cost_exhausted"`` when fewer
-    than ``k`` routes were found, no budget stop occurred and at least one
-    candidate was discarded for exceeding the cost limit; and
-    ``"unreachable"`` when no route exists with neither stop nor discard.
-    A budget stop wins over a cost-limit stop. The already closed routes
-    (and their costs, in rank order) are always returned even when a
-    limit cuts the search short, and empty lists are used when none were
-    found; ``expanded`` is always the actual closed-candidate count.
-    Omitting both limits keeps the exact legacy result keys and values.
+    When any of ``max_expanded``, ``max_cost`` or ``max_steps`` is
+    provided (not omitted/``None``) the result additionally carries
+    ``status``: ``"found"`` when all ``k`` routes were closed or the
+    search exhausted naturally with at least one route;
+    ``"budget_exhausted"`` when fewer than ``k`` routes were found and
+    the close budget stopped the search while candidates remained
+    pending; ``"step_exhausted"`` when fewer than ``k`` routes were
+    found, no budget stop occurred and the action window cut a candidate
+    off; ``"cost_exhausted"`` when fewer than ``k`` routes were found,
+    neither other stop occurred and at least one candidate was discarded
+    for exceeding the cost limit; and ``"unreachable"`` when no route
+    exists with neither stop nor discard. A budget stop wins over every
+    limit status and the step window wins over the cost limit. The
+    already closed routes (and their costs, in rank order) are always
+    returned even when a limit cuts the search short, and empty lists
+    are used when none were found; ``expanded`` is always the actual
+    closed-candidate count. Omitting all limits keeps the exact legacy
+    result keys and values.
     """
     # --- Validation: exactly ``plan``'s shared checks first, then the  ---
     # --- ``k`` check, then the optional limits, all before the search  ---
@@ -4384,9 +4664,13 @@ def plan_k(width, height, blocked, start, goal, k, costs=None,
     reservation_paths = _normalize_reservations(
         reservations, width, height, obstacles
     )
+    # The action window is validated last of all, still before the
+    # search starts.
+    _validate_max_steps(max_steps)
     return _search_k(width, height, obstacles, frames, start, goal,
                      costs, k, max_expanded, max_cost, allow_wait,
-                     cost_frames=cost_frames, reservations=reservation_paths)
+                     cost_frames=cost_frames,
+                     reservations=reservation_paths, max_steps=max_steps)
 
 
 def distance_field(width, height, blocked, goal, costs=None, trace=False):
@@ -4490,7 +4774,7 @@ def distance_field_any(width, height, blocked, goals, costs=None,
 
 def replay(width, height, blocked, start, goal, path, costs=None,
            dynamic_blocked=None, diagnose=False, allow_wait=False,
-           dynamic_costs=None, reservations=None):
+           dynamic_costs=None, reservations=None, max_steps=None):
     # --- Validation: identical to ``plan`` and fully completed before ---
     # --- the candidate path is inspected or judged in any way.        ---
     width = _validate_dimension(width, "width")
@@ -4526,6 +4810,10 @@ def replay(width, height, blocked, start, goal, path, costs=None,
     reservation_paths = _normalize_reservations(
         reservations, width, height, obstacles
     )
+    # The action window is validated last, still before the path
+    # structure is inspected; an omitted or ``None`` value keeps replay's
+    # behavior untouched.
+    _validate_max_steps(max_steps)
     points = _normalize_path(path, width, height)
 
     last_cost_frame = (len(cost_frames) - 1
@@ -4637,6 +4925,13 @@ def replay(width, height, blocked, start, goal, path, costs=None,
             return invalid("reservation_edge", t)
         seen.add(point)
         previous = point
+    if max_steps is not None and len(points) - 1 > max_steps:
+        # An otherwise valid route is still inadmissible when it needs
+        # more transitions than the action window allows: the first
+        # offending element is the one just past the window. Every
+        # existing semantic rule keeps its precedence, so this only fires
+        # for an otherwise valid path.
+        return invalid("step_limit", max_steps + 1)
     result = {"valid": True, "cost": total, "steps": len(points) - 1}
     if diagnose:
         result["error"] = None
@@ -4653,16 +4948,17 @@ def resume(checkpoint, max_expanded=None):
     # A resume always continues with the trace recorded (the checkpoint
     # carries it) and always snapshots again if the budget stops the
     # search once more. The checkpoint's cost limit (``None`` when the
-    # field is absent), its waiting flag (``False`` when absent) and its
-    # time-varying cost frames (``None`` when absent) keep governing the
-    # search.
+    # field is absent), its action window (``None`` when absent), its
+    # waiting flag (``False`` when absent) and its time-varying cost
+    # frames (``None`` when absent) keep governing the search.
     max_cost = restored["max_cost"]
+    max_steps = restored["max_steps"]
     allow_wait = restored["allow_wait"]
     cost_frames = restored["cost_frames"]
     reservations = restored["reservations"]
     if restored["planner"] == "plan_multi_start":
         if (restored["frames"] is None and cost_frames is None
-                and reservations is None):
+                and reservations is None and max_steps is None):
             return _search_multi_static(
                 restored["width"], restored["height"],
                 restored["obstacles"], restored["starts"],
@@ -4675,15 +4971,31 @@ def resume(checkpoint, max_expanded=None):
             restored["frames"], restored["starts"], restored["goal"],
             restored["costs"], True, max_expanded, max_cost, snapshot=True,
             allow_wait=allow_wait, state=restored["state"],
-            cost_frames=cost_frames, reservations=reservations
+            cost_frames=cost_frames, reservations=reservations,
+            max_steps=max_steps
         )
     if (restored["planner"] == "plan" and restored["frames"] is None
-            and cost_frames is None and reservations is None):
+            and cost_frames is None and reservations is None
+            and max_steps is None):
         return _search_static(
             restored["width"], restored["height"], restored["obstacles"],
             restored["start"], restored["goal"], restored["costs"],
             True, max_expanded, max_cost, snapshot=True,
             allow_wait=allow_wait, state=restored["state"]
+        )
+    if (restored["planner"] == "plan" and restored["frames"] is None
+            and cost_frames is None and reservations is None
+            and max_steps is not None):
+        # A static ``plan`` search with an action window runs as a
+        # history traversal (a single goal, the ``"plan"`` checkpoint
+        # kind), exactly as the uninterrupted call did.
+        return _search_any(
+            restored["width"], restored["height"], restored["obstacles"],
+            None, restored["start"], restored["goals"],
+            restored["costs"], True, max_expanded, max_cost, snapshot=True,
+            allow_wait=allow_wait, state=restored["state"],
+            cost_frames=None, reservations=None, planner_kind="plan",
+            max_steps=max_steps
         )
     if restored["planner"] == "plan":
         return _search_dynamic(
@@ -4691,14 +5003,16 @@ def resume(checkpoint, max_expanded=None):
             restored["frames"], restored["start"], restored["goal"],
             restored["costs"], True, max_expanded, max_cost, snapshot=True,
             allow_wait=allow_wait, state=restored["state"],
-            cost_frames=cost_frames, reservations=reservations
+            cost_frames=cost_frames, reservations=reservations,
+            max_steps=max_steps
         )
     return _search_any(
         restored["width"], restored["height"], restored["obstacles"],
         restored["frames"], restored["start"], restored["goals"],
         restored["costs"], True, max_expanded, max_cost, snapshot=True,
         allow_wait=allow_wait, state=restored["state"],
-        cost_frames=cost_frames, reservations=reservations
+        cost_frames=cost_frames, reservations=reservations,
+        planner_kind="plan_any", max_steps=max_steps
     )
 
 
@@ -4833,7 +5147,8 @@ def _restore_record(record, dynamic, width, height, unique_static=True):
     }
 
 
-def _restore_batch_record(record, dynamic, width, height, expected_count):
+def _restore_batch_record(record, dynamic, width, height, expected_count,
+                          unique_static=True):
     # Validate a saved ``plan_batch`` record for ``verify_batch_trace``
     # and normalize every entry's coordinates to tuples. The record must
     # be an object carrying ``results``: a sequence with exactly one
@@ -4870,7 +5185,8 @@ def _restore_batch_record(record, dynamic, width, height, expected_count):
     saved = []
     for index, item in enumerate(raw_results):
         try:
-            saved.append(_restore_record(item, dynamic, width, height))
+            saved.append(_restore_record(item, dynamic, width, height,
+                                         unique_static=unique_static))
         except (TypeError, ValueError) as exc:
             raise type(exc)(
                 f"record results[{index}] is not a valid planning "
@@ -5003,7 +5319,7 @@ def _canonical_json(value):
 def verify_trace(width, height, blocked, start, goal, record, costs=None,
                  dynamic_blocked=None, max_expanded=None, snapshot=False,
                  max_cost=None, allow_wait=False, dynamic_costs=None,
-                 reservations=None):
+                 reservations=None, max_steps=None):
     # --- Validation: ``plan``'s public checks in their usual order     ---
     # --- (only the never-present ``trace`` flag is skipped; the audit  ---
     # --- always recomputes with the trace on). The record is inspected  ---
@@ -5028,8 +5344,9 @@ def verify_trace(width, height, blocked, start, goal, record, costs=None,
         )
     # The waiting flag, the budget, the snapshot flag, the cost limit,
     # the time-varying cost frames and the reserved routes keep exactly
-    # ``plan``'s positions; every check is decided before the record is
-    # inspected and before the audit search starts.
+    # ``plan``'s positions; the action window is validated last of all.
+    # Every check is decided before the record is inspected and before
+    # the audit search starts.
     _validate_allow_wait(allow_wait)
     _validate_budget(max_expanded)
     _validate_snapshot_flag(snapshot)
@@ -5042,9 +5359,15 @@ def verify_trace(width, height, blocked, start, goal, record, costs=None,
     reservation_paths = _normalize_reservations(
         reservations, width, height, obstacles
     )
+    _validate_max_steps(max_steps)
     dynamic = (frames is not None or cost_frames is not None
                or reservation_paths is not None)
-    saved = _restore_record(record, dynamic, width, height)
+    # A static search with a step window is a history traversal, so its
+    # trace may record a coordinate more than once (exactly as
+    # ``plan_any``'s static route tree does).
+    history = dynamic or max_steps is not None
+    saved = _restore_record(record, dynamic, width, height,
+                            unique_static=not history)
     # --- Audit: recompute the deterministic result with the trace on   ---
     # --- and compare field by field in the fixed order. Nothing of the ---
     # --- recomputation leaks into the report.                          ---
@@ -5052,7 +5375,15 @@ def verify_trace(width, height, blocked, start, goal, record, costs=None,
         result = _search_dynamic(
             width, height, obstacles, frames, start, goal, costs, True,
             max_expanded, max_cost, snapshot, allow_wait,
-            cost_frames=cost_frames, reservations=reservation_paths
+            cost_frames=cost_frames, reservations=reservation_paths,
+            max_steps=max_steps
+        )
+    elif max_steps is not None:
+        result = _search_any(
+            width, height, obstacles, None, start, (goal,), costs, True,
+            max_expanded, max_cost, snapshot, allow_wait,
+            cost_frames=None, reservations=None, planner_kind="plan",
+            max_steps=max_steps
         )
     else:
         result = _search_static(
@@ -5083,7 +5414,7 @@ def verify_trace(width, height, blocked, start, goal, record, costs=None,
 def verify_any_trace(width, height, blocked, start, goals, record,
                      costs=None, dynamic_blocked=None, max_expanded=None,
                      snapshot=False, max_cost=None, allow_wait=False,
-                     dynamic_costs=None, reservations=None):
+                     dynamic_costs=None, reservations=None, max_steps=None):
     # --- Validation: ``plan_any``'s public checks in their exact order  ---
     # --- (``goals`` takes ``goal``'s position; only the never-present   ---
     # --- ``trace`` flag is skipped, since the audit always recomputes   ---
@@ -5112,8 +5443,9 @@ def verify_any_trace(width, height, blocked, start, goals, record,
         )
     # The waiting flag, the budget, the snapshot flag, the cost limit,
     # the time-varying cost frames and the reserved routes keep exactly
-    # ``plan_any``'s positions; every check is decided before the record
-    # is inspected and before the audit search starts.
+    # ``plan_any``'s positions; the action window is validated last of
+    # all. Every check is decided before the record is inspected and
+    # before the audit search starts.
     _validate_allow_wait(allow_wait)
     _validate_budget(max_expanded)
     _validate_snapshot_flag(snapshot)
@@ -5126,6 +5458,7 @@ def verify_any_trace(width, height, blocked, start, goals, record,
     reservation_paths = _normalize_reservations(
         reservations, width, height, obstacles
     )
+    _validate_max_steps(max_steps)
     dynamic = (frames is not None or cost_frames is not None
                or reservation_paths is not None)
     # ``plan_any``'s route-tree search closes a coordinate through each
@@ -5141,7 +5474,8 @@ def verify_any_trace(width, height, blocked, start, goals, record,
     result = _search_any(
         width, height, obstacles, frames, start, goal_points, costs, True,
         max_expanded, max_cost, snapshot, allow_wait,
-        cost_frames=cost_frames, reservations=reservation_paths
+        cost_frames=cost_frames, reservations=reservation_paths,
+        planner_kind="plan_any", max_steps=max_steps
     )
     index = _first_difference(saved["path"], result["path"])
     if index is not None:
@@ -5167,7 +5501,7 @@ def verify_any_trace(width, height, blocked, start, goals, record,
 def verify_batch_trace(width, height, blocked, requests, record, costs=None,
                        dynamic_blocked=None, max_expanded=None, snapshot=False,
                        max_cost=None, allow_wait=False, dynamic_costs=None,
-                       reservations=None):
+                       reservations=None, max_steps=None):
     # --- Validation: ``plan_batch``'s public checks in their exact    ---
     # --- order (only the never-present ``trace`` flag is skipped; the ---
     # --- audit always recomputes with the trace on). The record is    ---
@@ -5201,8 +5535,9 @@ def verify_batch_trace(width, height, blocked, requests, record, costs=None,
                 )
     # The waiting flag, the budget, the snapshot flag, the cost limit,
     # the time-varying cost frames and the reserved routes keep exactly
-    # ``plan_batch``'s positions; every check is decided before the
-    # record is inspected and before any audit search starts.
+    # ``plan_batch``'s positions; the action window is validated last of
+    # all. Every check is decided before the record is inspected and
+    # before any audit search starts.
     _validate_allow_wait(allow_wait)
     _validate_budget(max_expanded)
     _validate_snapshot_flag(snapshot)
@@ -5215,10 +5550,14 @@ def verify_batch_trace(width, height, blocked, requests, record, costs=None,
     reservation_paths = _normalize_reservations(
         reservations, width, height, obstacles
     )
+    _validate_max_steps(max_steps)
     dynamic = (frames is not None or cost_frames is not None
                or reservation_paths is not None)
+    # A static batch query with a step window runs as a history
+    # traversal, so its trace may repeat coordinates (like plan_any's).
+    history = dynamic or max_steps is not None
     saved = _restore_batch_record(record, dynamic, width, height,
-                                  len(pairs))
+                                  len(pairs), unique_static=not history)
     # --- Audit: recompute each request's independent ``plan`` result  ---
     # --- with the trace on, in ``requests`` order, and compare field  ---
     # --- by field in the fixed order. The first difference stops the  ---
@@ -5230,7 +5569,15 @@ def verify_batch_trace(width, height, blocked, requests, record, costs=None,
             result = _search_dynamic(
                 width, height, obstacles, frames, start, goal, costs,
                 True, max_expanded, max_cost, snapshot, allow_wait,
-                cost_frames=cost_frames, reservations=reservation_paths
+                cost_frames=cost_frames, reservations=reservation_paths,
+                max_steps=max_steps
+            )
+        elif max_steps is not None:
+            result = _search_any(
+                width, height, obstacles, None, start, (goal,), costs,
+                True, max_expanded, max_cost, snapshot, allow_wait,
+                cost_frames=None, reservations=None, planner_kind="plan",
+                max_steps=max_steps
             )
         else:
             result = _search_static(

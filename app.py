@@ -5314,7 +5314,7 @@ def plan_batch(width, height, blocked, requests, costs=None, trace=False,
 
 def plan_agents(width, height, blocked, requests, costs=None, trace=False,
                 dynamic_blocked=None, allow_wait=False, dynamic_costs=None,
-                reservations=None):
+                reservations=None, max_expanded=None):
     # --- Validation: ``plan``'s shared checks in their usual order,    ---
     # --- with ``requests`` occupying the position of ``start``/``goal``---
     # --- in that sequence. Every check is decided before any search    ---
@@ -5363,6 +5363,13 @@ def plan_agents(width, height, blocked, requests, costs=None, trace=False,
     reservation_paths = _normalize_reservations(
         reservations, width, height, obstacles
     )
+    # The optional shared expansion budget is the last thing validated,
+    # after every grid, requests, obstacle, cost, trace, dynamic-frame,
+    # waiting, dynamic-cost and reservation check, so an invalid batch
+    # never returns partial results. It reuses ``plan``'s non-boolean,
+    # non-negative-integer rules: other types raise ``TypeError`` and a
+    # negative value raises ``ValueError``.
+    _validate_budget(max_expanded)
     # Prioritized planning in request order: every agent is searched
     # exactly as ``plan`` would search it, except that the routes already
     # assigned to earlier agents are added to the reservations, so a
@@ -5377,7 +5384,15 @@ def plan_agents(width, height, blocked, requests, costs=None, trace=False,
     # The input order fixes the priority and duplicate
     # requests are kept. The first agent whose search comes back empty
     # stops the batch immediately: later agents are never searched and
-    # the batch is reported ``unreachable`` with the failing index.
+    # the batch is reported with that agent's index as ``failed_index``.
+    # With a shared budget every agent receives only the close count the
+    # batch still has left, so the budget accumulates across agents and
+    # counts each actually closed static or space-time node (waits
+    # included): an agent that reaches its goal inside the remainder is
+    # ``found`` and the next request proceeds; an agent that spends the
+    # remainder first is reported ``budget_exhausted``; a naturally
+    # exhausted candidate heap keeps the plain ``unreachable`` report.
+    budget_active = max_expanded is not None
     results = []
     planned = []
     total_expanded = 0
@@ -5386,11 +5401,13 @@ def plan_agents(width, height, blocked, requests, costs=None, trace=False,
             effective = (reservation_paths or ()) + tuple(planned)
         else:
             effective = reservation_paths
+        agent_budget = (max_expanded - total_expanded
+                        if budget_active else None)
         if (frames is not None or cost_frames is not None
                 or effective is not None):
             result = _search_dynamic(
                 width, height, obstacles, frames, start, goal, costs,
-                trace, None, None, False, allow_wait,
+                trace, agent_budget, None, False, allow_wait,
                 cost_frames=cost_frames, reservations=effective,
                 goal_not_before=(_goal_not_before(effective, goal)
                                  if effective is not None else None)
@@ -5398,13 +5415,17 @@ def plan_agents(width, height, blocked, requests, costs=None, trace=False,
         else:
             result = _search_static(
                 width, height, obstacles, start, goal, costs, trace,
-                None, None, False, allow_wait
+                agent_budget, None, False, allow_wait
             )
         results.append(result)
         total_expanded += result["expanded"]
         if result["path"] is None:
+            # Without a budget a failed agent is always unreachable; with
+            # one, its own status distinguishes a spent remainder from a
+            # naturally exhausted candidate heap.
+            status = result.get("status", "unreachable")
             return {
-                "status": "unreachable",
+                "status": status,
                 "failed_index": index,
                 "results": results,
                 "expanded": total_expanded,

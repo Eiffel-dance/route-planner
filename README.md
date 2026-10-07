@@ -25,6 +25,14 @@ Tests: python3 -m unittest discover -s tests -v
 - 提供 `max_cost` 时结果始终携带 `status`：成功为 `"found"`；没有可行终点时 `path`/`cost` 为 `None`，`expanded` 只统计实际关闭的节点，若有候选因超限被丢弃则为 `"cost_exhausted"`，否则为 `"unreachable"`；若同时给出 `max_expanded`，预算耗尽优先为 `"budget_exhausted"`。`trace` 仍只记录实际关闭的节点；`start == goal` 的单点零代价结果与零扩展预算的既有规则不变。
 - `snapshot=True` 生成的 checkpoint 在提供 `max_cost` 时记录该值（未提供时不新增字段）；`resume` 对缺少该字段的旧 checkpoint 按 `None` 兼容，字段存在时按同一规则校验（类型错误抛 `TypeError`，负值或与内部状态不一致抛 `ValueError`），所有检查先于恢复搜索，且恢复结果与一次未暂停的调用完全一致。`replay` 不接受 `max_cost` 参数。
 
+**步数上限（`max_steps`）**
+- `plan`、`plan_any`、`plan_batch`、`plan_multi_start`、`plan_k` 与 `replay` 在末尾接受可选参数 `max_steps=None`。它约束路线从起点到终点允许使用的转移次数上限：连续等待也计作一步；路径至多含 `max_steps+1` 个坐标；时间帧下标在所有时空模式下与路径步数一致。`start == goal` 在零上限时仍以单点路线成功。
+- 省略或为 `None` 时，返回键、路径选择、扩展顺序、异常类型与 tie-break 与既有行为完全一致。提供时必须是非负且非布尔的整数：其他类型抛 `TypeError`，负数抛 `ValueError`；该校验在全部既有校验（含 `reservations`）之后、搜索开始前进行；`plan_batch` 在任一请求被搜索前完成该校验，非法批次绝不返回部分结果。
+- 启用上限后，搜索既不生成也不关闭上限之外的状态：处于上限深度的候选不再扩展，而静态/动态障碍、`dynamic_costs`、`reservations`、等待、`allow_wait`、禁回访与 `max_cost` 等既有可行性规则全部保持原义。成功时返回原有 `path`/`cost`/`expanded` 并携带 `status="found"`；失败时若确有本可行的候选因超限被裁掉则为 `"step_exhausted"`，否则沿用 `"unreachable"` 或 `"cost_exhausted"`；同时给出 `max_expanded` 时 `"budget_exhausted"` 优先。`expanded` 与 `expanded_nodes` 只计实际关闭的状态。
+- 上限不改变既有 tie-break、`plan_k` 的唯一路径排序（返回结果仍是无上限结果的对应前缀）、`plan_batch` 的请求顺序与多起点胜出规则；只有当无上限的最优路线装不进窗口时，恰好能装下窗口的替代路线才会胜出。
+- `snapshot=True` 在提供 `max_steps` 时把该值写入 checkpoint（未提供时不新增字段）；`resume` 对缺失字段按 `None` 兼容，并在恢复搜索前校验字段类型/取值并交叉检查内部状态（类型错误抛 `TypeError`；负值、无窗口却记录步数裁剪、或存在超出窗口的待处理/已记录路线抛 `ValueError`），恢复结果与一次未中断的调用逐字段相同。
+- `replay` 校验同一上限：非诊断模式下超长路径固定返回 `{"valid": False, "cost": None, "steps": None}`；`diagnose=True` 时以唯一错误码 `step_limit` 报告，`error_index` 为首次越界下标（`max_steps + 1`），且只有在所有更早元素与更早优先级的规则都通过后才会产生该错误。所有新增结果均可 JSON 序列化。
+
 `plan_any(width, height, blocked, start, goals, costs=None, trace=False, dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None)` 接受与 `plan` 相同的网格、`blocked`、`start` 及可选代价、轨迹、动态障碍、预算、快照和代价上限参数，另收一个非空 `goals` 候选终点序列，返回一条确定的最低代价路线（返回结构与 `plan` 相同，`path` 末点为选中的候选终点）；该路径可直接以其末点作为 `goal` 交给 `replay` 离线核验。
 
 **多终点（`goals`）**

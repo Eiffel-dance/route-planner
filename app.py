@@ -28,7 +28,10 @@ dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None,
 allow_wait=False, dynamic_costs=None, reservations=None)`` and
 ``verify_batch_trace(width, height, blocked, requests, record, costs=None,
 dynamic_blocked=None, max_expanded=None, snapshot=False, max_cost=None,
-allow_wait=False, dynamic_costs=None, reservations=None)``.
+allow_wait=False, dynamic_costs=None, reservations=None)`` and
+``verify_agents(width, height, blocked, requests, record, costs=None,
+dynamic_blocked=None, allow_wait=False, dynamic_costs=None,
+reservations=None)``.
 
 Semantics:
 - Four-neighborhood moves, Manhattan heuristic. Without ``costs`` each step
@@ -729,6 +732,57 @@ Batch offline audit (``verify_batch_trace``):
   goal`` results are audited with the independent ``plan`` semantics,
   and the report is JSON-serializable.
 
+Multi-agent offline audit (``verify_agents``):
+- ``verify_agents(width, height, blocked, requests, record, costs=None,
+  dynamic_blocked=None, allow_wait=False, dynamic_costs=None,
+  reservations=None)`` checks a saved ``plan_agents`` result against the
+  deterministic prioritized planning the same arguments produce, without
+  exposing the recomputation. ``record`` may be the dict a ``trace=True``
+  ``plan_agents`` call returned or its JSON round-tripped equivalent:
+  coordinates may be lists or tuples, key order is irrelevant and extra
+  keys are ignored. The shared grid, requests, costs, dynamic-frame,
+  waiting, time-varying cost and reservation arguments are validated
+  first, in exactly ``plan_agents``'s public order and with its exception
+  types (only the never-present ``trace`` flag is skipped; the audit
+  always recomputes with the trace on); only then is the record
+  inspected, so a missing or malformed record never skips a grid or
+  requests error.
+- The record must be an object carrying ``status``, ``results`` and
+  ``expanded``. A ``"found"`` record covers every request; an
+  ``"unreachable"`` record additionally carries ``failed_index`` and its
+  ``results`` cover exactly the requests up to and including that index.
+  Every entry follows ``verify_trace``'s record rules -- it must carry at
+  least ``path``, ``cost``, ``expanded`` and ``expanded_nodes`` with the
+  static/dynamic mode arity that agent's search selects (agent 0 follows
+  the shared arguments; every later agent's search is time-expanded by
+  the routes the earlier agents already occupy, so its trace records
+  ``(x, y, t)`` triples, and a static search never records a state
+  twice). A record that is not an object, lacks a required field, has a
+  wrongly typed field or a wrongly shaped trajectory entry raises
+  ``TypeError``; an unknown status, a wrong result count, an out-of-range
+  ``failed_index``, an out-of-bounds coordinate or a trajectory entry
+  inconsistent with the mode raises ``ValueError``. Every such check is
+  decided before any audit search starts, and the record is never
+  modified.
+- A structurally legal record never raises: the prioritized planning is
+  recomputed in ``requests`` order with the trace on -- every agent
+  searched exactly as ``plan_agents`` searches it, with the earlier
+  agents' routes added to the reservations, so vertex conflicts, reversed
+  edges, persistent goal occupancy, the first unreachable agent stopping
+  the batch, the persistent last frame, waiting, time-varying costs and
+  the reservation semantics are all covered -- and compared field by
+  field. The report is exactly ``{"valid": bool, "request_index": ...,
+  "mismatch": ..., "index": ...}``: the earliest differing agent first
+  and, within it, the first differing field in the fixed order ``path``,
+  ``cost``, ``expanded``, ``expanded_nodes``; a path or trajectory
+  difference also gives the zero-based index of the first differing
+  element, every other difference reports ``index`` ``None``. Once every
+  compared agent matches, the batch ``status``, ``failed_index`` and
+  total ``expanded`` are compared in that order, reported with
+  ``request_index`` ``None``. A fully consistent record returns ``valid``
+  true with ``request_index``, ``mismatch`` and ``index`` all ``None``,
+  and the report is JSON-serializable.
+
 Validation (all performed before the search starts):
 - ``width``/``height`` must be positive integers.
 - ``start``, ``goal`` and every entry of ``blocked`` must be grid
@@ -767,7 +821,8 @@ from collections.abc import Iterable, Sequence
 __all__ = ["plan", "plan_any", "plan_k", "plan_batch", "plan_agents",
            "plan_multi_start",
            "replay", "resume", "distance_field", "distance_field_any",
-           "verify_trace", "verify_any_trace", "verify_batch_trace"]
+           "verify_trace", "verify_any_trace", "verify_batch_trace",
+           "verify_agents"]
 
 # Fixed neighbor generation order: +x, -x, +y, -y.
 _NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1))
@@ -4824,6 +4879,103 @@ def _restore_batch_record(record, dynamic, width, height, expected_count):
     return saved
 
 
+def _restore_agents_record(record, dynamic, width, height, expected_count):
+    # Validate a saved ``plan_agents`` record for ``verify_agents`` and
+    # normalize every entry's coordinates to tuples. The record must be an
+    # object carrying ``status``, ``results`` and ``expanded``; a
+    # ``"found"`` record covers every request, an ``"unreachable"`` record
+    # additionally carries ``failed_index`` and its ``results`` cover
+    # exactly the requests up to and including that index. Every entry is
+    # a valid ``plan`` record as ``_restore_record`` defines it; agent 0
+    # searches in the mode the shared arguments select, while every later
+    # agent's search is time-expanded by the routes the earlier agents
+    # already occupy, so its trajectory records ``(x, y, t)`` triples. A
+    # record that is not an object, lacks a required field, has a wrongly
+    # typed field or a wrongly shaped trajectory entry raises
+    # ``TypeError``; an unknown status, a wrong result count, an
+    # out-of-range ``failed_index``, an out-of-bounds coordinate or a
+    # trajectory entry inconsistent with the mode raises ``ValueError``.
+    # Everything is decided here, before any audit search starts, and the
+    # record itself is never modified.
+    if not isinstance(record, dict):
+        raise TypeError(
+            f"record must be a multi-agent result object, "
+            f"got {type(record).__name__}"
+        )
+    for key in ("status", "results", "expanded"):
+        if key not in record:
+            raise TypeError(f"record is missing required field {key!r}")
+    status = record["status"]
+    if not isinstance(status, str):
+        raise TypeError(
+            f"record status must be a string, got {type(status).__name__}"
+        )
+    if status not in ("found", "unreachable"):
+        raise ValueError(
+            f"record status {status!r} is not a multi-agent status"
+        )
+    expanded = record["expanded"]
+    if not _is_int(expanded):
+        raise TypeError(
+            f"record expanded must be an int, "
+            f"got {type(expanded).__name__}"
+        )
+    raw_results = record["results"]
+    if (isinstance(raw_results, (str, bytes))
+            or not isinstance(raw_results, Sequence)):
+        raise TypeError(
+            f"record results must be a sequence of planning result "
+            f"objects, got {type(raw_results).__name__}"
+        )
+    if status == "found":
+        if len(raw_results) != expected_count:
+            raise ValueError(
+                f"record results must contain exactly {expected_count} "
+                f"entries, got {len(raw_results)}"
+            )
+    else:
+        if "failed_index" not in record:
+            raise TypeError(
+                "record is missing required field 'failed_index'"
+            )
+        failed_index = record["failed_index"]
+        if not _is_int(failed_index):
+            raise TypeError(
+                f"record failed_index must be an int, "
+                f"got {type(failed_index).__name__}"
+            )
+        if not 0 <= failed_index < expected_count:
+            raise ValueError(
+                f"record failed_index must be a request index, "
+                f"got {failed_index}"
+            )
+        if len(raw_results) != failed_index + 1:
+            raise ValueError(
+                f"record results must contain exactly "
+                f"{failed_index + 1} entries, got {len(raw_results)}"
+            )
+    saved = []
+    for index, item in enumerate(raw_results):
+        # Agent 0 follows the shared arguments; every later agent's search
+        # is time-expanded by the routes the earlier agents already
+        # occupy, so its trace records ``(x, y, t)`` triples.
+        try:
+            saved.append(_restore_record(
+                item, dynamic or index > 0, width, height
+            ))
+        except (TypeError, ValueError) as exc:
+            raise type(exc)(
+                f"record results[{index}] is not a valid planning "
+                f"record: {exc}"
+            ) from exc
+    return {
+        "status": status,
+        "failed_index": record.get("failed_index"),
+        "results": saved,
+        "expanded": expanded,
+    }
+
+
 def _first_difference(saved, actual):
     # The zero-based index of the first position where a recorded
     # sequence differs from the recomputed one, or ``None`` when they
@@ -5121,6 +5273,149 @@ def verify_batch_trace(width, height, blocked, requests, record, costs=None,
                     and _canonical_json(item["checkpoint"])
                     != _canonical_json(result["checkpoint"]))):
             return report("checkpoint")
+    return {
+        "valid": True,
+        "request_index": None,
+        "mismatch": None,
+        "index": None,
+    }
+
+
+def verify_agents(width, height, blocked, requests, record, costs=None,
+                  dynamic_blocked=None, allow_wait=False, dynamic_costs=None,
+                  reservations=None):
+    # --- Validation: ``plan_agents``'s public checks in their exact   ---
+    # --- order (only the never-present ``trace`` flag is skipped; the ---
+    # --- audit always recomputes with the trace on). The record is    ---
+    # --- inspected only after every shared and per-request check has  ---
+    # --- run, so a missing or malformed record never skips a grid or  ---
+    # --- requests error and a failed check never starts a search.     ---
+    width = _validate_dimension(width, "width")
+    height = _validate_dimension(height, "height")
+    pairs = _normalize_requests(requests)
+    for index, (start, goal) in enumerate(pairs):
+        _check_bounds(start, width, height, f"requests[{index}] start")
+        _check_bounds(goal, width, height, f"requests[{index}] goal")
+    obstacles = _normalize_blocked(blocked, width, height)
+    for index, (start, goal) in enumerate(pairs):
+        if start in obstacles:
+            raise ValueError(
+                f"requests[{index}] start {start} lies on a blocked cell"
+            )
+        if goal in obstacles:
+            raise ValueError(
+                f"requests[{index}] goal {goal} lies on a blocked cell"
+            )
+    costs = _normalize_costs(costs, width, height)
+    frames = _normalize_dynamic_blocked(dynamic_blocked, width, height)
+    if frames is not None:
+        for index, (start, _) in enumerate(pairs):
+            if start in frames[0]:
+                raise ValueError(
+                    f"requests[{index}] start {start} is blocked at "
+                    f"frame 0"
+                )
+    # The waiting flag, the time-varying cost frames and the reserved
+    # routes keep exactly ``plan_agents``'s positions; every check is
+    # decided before the record is inspected and before any audit search
+    # starts.
+    _validate_allow_wait(allow_wait)
+    cost_frames = _normalize_dynamic_costs(dynamic_costs, width, height)
+    if cost_frames is not None and costs is not None:
+        raise ValueError(
+            "costs and dynamic_costs cannot both be provided"
+        )
+    reservation_paths = _normalize_reservations(
+        reservations, width, height, obstacles
+    )
+    dynamic = (frames is not None or cost_frames is not None
+               or reservation_paths is not None)
+    saved = _restore_agents_record(record, dynamic, width, height,
+                                   len(pairs))
+    # --- Audit: recompute the prioritized planning in ``requests``     ---
+    # --- order with the trace on, exactly as ``plan_agents`` does:     ---
+    # --- every earlier agent's route joins the reservations of the     ---
+    # --- later searches and the first unreachable agent stops the      ---
+    # --- batch. The earliest differing agent is reported first; within ---
+    # --- it the fields are compared in the fixed order, and only then  ---
+    # --- are the batch status, failed_index and total expanded         ---
+    # --- compared. Nothing of the recomputation leaks into the report  ---
+    # --- and the record is never modified.                             ---
+    recomputed = []
+    planned = []
+    total_expanded = 0
+    failed_index = None
+    for index, (start, goal) in enumerate(pairs):
+        if planned:
+            effective = (reservation_paths or ()) + tuple(planned)
+        else:
+            effective = reservation_paths
+        if (frames is not None or cost_frames is not None
+                or effective is not None):
+            result = _search_dynamic(
+                width, height, obstacles, frames, start, goal, costs,
+                True, None, None, False, allow_wait,
+                cost_frames=cost_frames, reservations=effective,
+                goal_not_before=(_goal_not_before(effective, goal)
+                                 if effective is not None else None)
+            )
+        else:
+            result = _search_static(
+                width, height, obstacles, start, goal, costs, True,
+                None, None, False, allow_wait
+            )
+        recomputed.append(result)
+        total_expanded += result["expanded"]
+        if result["path"] is None:
+            failed_index = index
+            break
+        planned.append(tuple(result["path"]))
+    saved_results = saved["results"]
+    for request_index in range(min(len(saved_results), len(recomputed))):
+        item = saved_results[request_index]
+        result = recomputed[request_index]
+
+        def report(mismatch, index=None):
+            return {
+                "valid": False,
+                "request_index": request_index,
+                "mismatch": mismatch,
+                "index": index,
+            }
+
+        index = _first_difference(item["path"], result["path"])
+        if index is not None:
+            return report("path", index)
+        if item["cost"] != result["cost"]:
+            return report("cost")
+        if item["expanded"] != result["expanded"]:
+            return report("expanded")
+        index = _first_difference(item["expanded_nodes"],
+                                  result["expanded_nodes"])
+        if index is not None:
+            return report("expanded_nodes", index)
+    if saved["status"] != ("found" if failed_index is None
+                           else "unreachable"):
+        return {
+            "valid": False,
+            "request_index": None,
+            "mismatch": "status",
+            "index": None,
+        }
+    if saved["failed_index"] != failed_index:
+        return {
+            "valid": False,
+            "request_index": None,
+            "mismatch": "failed_index",
+            "index": None,
+        }
+    if saved["expanded"] != total_expanded:
+        return {
+            "valid": False,
+            "request_index": None,
+            "mismatch": "expanded",
+            "index": None,
+        }
     return {
         "valid": True,
         "request_index": None,
